@@ -221,7 +221,7 @@ class Tab1Widget(QWidget):
         left_layout.addWidget(self.export_points_btn)
         left_layout.addWidget(self.import_points_btn)
 
-        self.metrics_label = QLabel('距離計算\n- Clamp XY平面→U軸: --\n- W円面→Clamp中心面: --\n- CseXと直動X: --\n- CseZ軸と直動Z軸: --\n- CseZ軸と直動Z軸: --')
+        self.metrics_label = QLabel('距離計算\n- Clamp XY平面→U軸: --\n- W円面→Clamp中心面: --\n- CseX軸と直動X軸: --\n- CseY軸と直動Y軸: --\n- CseZ軸と直動Z軸: --')
         self.metrics_label.setWordWrap(True)
         self._apply_theme_dependent_styles()
         left_layout.addWidget(self.metrics_label)
@@ -1581,29 +1581,48 @@ class Tab1Widget(QWidget):
                 clamp_center_plane_normal,
             )
 
+        def _signed_angle_deg(target_vec, measured_vec, sign_axis_vec):
+            target_unit = self._normalize(np.array(target_vec, dtype=float))
+            measured_unit = self._normalize(np.array(measured_vec, dtype=float))
+            sign_axis_unit = self._normalize(np.array(sign_axis_vec, dtype=float))
+            if target_unit is None or measured_unit is None or sign_axis_unit is None:
+                return None
+            cross_term = float(np.dot(sign_axis_unit, np.cross(target_unit, measured_unit)))
+            dot_term = float(np.clip(np.dot(target_unit, measured_unit), -1.0, 1.0))
+            return float(np.degrees(np.arctan2(cross_term, dot_term)))
+
+        def _format_rotation_angle(angle_deg, rotation_name):
+            if angle_deg is None:
+                return f'-- | {rotation_name}回転が影響。'
+            magnitude = abs(angle_deg)
+            display_magnitude = min(magnitude, abs(180.0 - magnitude))
+            if display_magnitude < 1e-6:
+                status = '一致'
+            elif angle_deg > 0:
+                status = '行き過ぎ'
+            else:
+                status = '足りない'
+            return f'{display_magnitude:.1f}° | {rotation_name}回転が影響。（{status}）'
+
         # V ベクトルとクランプ座標系の Y 軸のなす角
         v_axis = side_axis_info.get('V Side')
         if v_axis is not None:
-            v_vec = self._normalize(np.array(v_axis['dir'], dtype=float))
+            v_vec = np.array(v_axis['dir'], dtype=float)
             axes = self._infer_xyz_from_clamp_planes()
             if v_vec is not None and axes is not None:
-                y_axis = self._normalize(axes['y'])
-                if y_axis is not None:
-                    cos_angle = np.dot(v_vec, y_axis)
-                    cos_angle = np.clip(cos_angle, -1.0, 1.0)
-                    angle_v_y = float(np.degrees(np.arccos(np.abs(cos_angle))))
+                y_axis = axes['y']
+                x_axis = axes['x']
+                angle_v_y = _signed_angle_deg(y_axis, v_vec, x_axis)
 
         # W ベクトルとクランプ座標系の Z 軸のなす角
         w_axis = side_axis_info.get('W Side')
         if w_axis is not None:
-            w_vec = self._normalize(np.array(w_axis['dir'], dtype=float))
+            w_vec = np.array(w_axis['dir'], dtype=float)
             axes = self._infer_xyz_from_clamp_planes()
             if w_vec is not None and axes is not None:
-                z_axis = self._normalize(axes['z'])
-                if z_axis is not None:
-                    cos_angle = np.dot(w_vec, z_axis)
-                    cos_angle = np.clip(cos_angle, -1.0, 1.0)
-                    angle_w_z = float(np.degrees(np.arccos(np.abs(cos_angle))))
+                z_axis = axes['z']
+                y_axis = axes['y']
+                angle_w_z = _signed_angle_deg(z_axis, w_vec, y_axis)
 
         # 遠位Clamp Surface の平面とクランプ座標系の X 軸とのなす角（CseX）
         cse_points = self.mode_points.get('遠位Clamp Surface', [])
@@ -1611,26 +1630,23 @@ class Tab1Widget(QWidget):
             fit = self._fit_plane_basis(cse_points)
             axes = self._infer_xyz_from_clamp_planes()
             if fit is not None and axes is not None:
-                cse_normal = self._normalize(fit[1])
-                x_axis = self._normalize(axes['x'])
-                if cse_normal is not None and x_axis is not None:
-                    cos_angle = np.dot(cse_normal, x_axis)
-                    cos_angle = np.clip(cos_angle, -1.0, 1.0)
-                    angle_cse_x = float(np.degrees(np.arccos(np.abs(cos_angle))))
+                cse_normal = np.array(fit[1], dtype=float)
+                x_axis = axes['x']
+                z_axis = axes['z']
+                angle_cse_x = _signed_angle_deg(x_axis, cse_normal, z_axis)
 
         def _fmt(v):
             return '--' if v is None else f'{v:.3f} mm'
-
-        def _fmt_angle(v):
-            return '--' if v is None else f'{v:.1f}°'
 
         self.metrics_label.setText(
             '距離計算\n'
             f'- Clamp XY平面→U軸: {_fmt(d_u_clamp_xy)}\n'
             f'- W円面→Clamp中心面: {_fmt(d_w_circle_clamp_center)}\n'
-            f'- CseXと直動X: {_fmt_angle(angle_cse_x)}\n'
-            f'- CseZ軸と直動Z軸: {_fmt_angle(angle_v_y)}\n'
-            f'- CseZ軸と直動Z軸: {_fmt_angle(angle_w_z)}'
+            f'- CseX軸と直動X軸: {_format_rotation_angle(angle_cse_x, "W")}\n'
+            f'- CseY軸と直動Y軸: {_format_rotation_angle(angle_v_y, "V")}\n'
+            f'- CseZ軸と直動Z軸: {_format_rotation_angle(angle_w_z, "U")}\n'
+            '※右ネジ方向を正\n'
+            '※足りない / 行き過ぎ　が正しく動作するかは未検討'
         )
 
         # 右画面にも距離テキストを表示
