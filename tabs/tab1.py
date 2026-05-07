@@ -1739,7 +1739,7 @@ class Tab1Widget(QWidget):
             return '--' if v is None else f'{v:.3f} mm'
 
         self.metrics_label.setText(
-            '距離計算\n'
+            '◎回転機構の初期姿勢\n'
             f'- CseX軸と直動X軸: {_format_rotation_angle(angle_cse_x, "W")}\n'
             f'- CseY軸と直動Y軸: {_format_rotation_angle(angle_v_y, "V")}\n'
             f'- CseZ軸と直動Z軸: {_format_rotation_angle(angle_w_z, "U")}\n'
