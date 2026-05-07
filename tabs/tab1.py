@@ -15,6 +15,8 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QListWidget,
     QColorDialog,
+    QDoubleSpinBox,
+    QSlider,
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread, QEvent
 from PyQt6.QtGui import QColor
@@ -132,6 +134,9 @@ class Tab1Widget(QWidget):
         self.background_color = '#2a2f38'
         self.model_color = '#d9dbe0'
         self._load_visual_settings()
+        self.lse_value = self._load_lse_value()
+        self.point_size_value = self._load_point_size_value()
+        self.co_point_size_value = self._load_co_point_size_value()
 
         root_layout = QVBoxLayout(self)
         top_layout = QHBoxLayout()
@@ -221,6 +226,39 @@ class Tab1Widget(QWidget):
         left_layout.addWidget(self.export_points_btn)
         left_layout.addWidget(self.import_points_btn)
 
+        lse_row = QHBoxLayout()
+        self.lse_label = QLabel('Lse')
+        self.lse_spin = QDoubleSpinBox()
+        self.lse_spin.setRange(-9999.0, 9999.0)
+        self.lse_spin.setDecimals(3)
+        self.lse_spin.setSingleStep(0.1)
+        self.lse_spin.setSuffix(' mm')
+        self.lse_spin.setValue(self.lse_value)
+        self.lse_spin.valueChanged.connect(self._on_lse_value_changed)
+        lse_row.addWidget(self.lse_label)
+        lse_row.addWidget(self.lse_spin, 1)
+        left_layout.addLayout(lse_row)
+
+        point_size_row = QHBoxLayout()
+        self.point_size_label = QLabel('点サイズ')
+        self.point_size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.point_size_slider.setRange(4, 30)
+        self.point_size_slider.setValue(self.point_size_value)
+        self.point_size_slider.valueChanged.connect(self._on_point_size_changed)
+        point_size_row.addWidget(self.point_size_label)
+        point_size_row.addWidget(self.point_size_slider, 1)
+        left_layout.addLayout(point_size_row)
+
+        co_point_size_row = QHBoxLayout()
+        self.co_point_size_label = QLabel('Co_Origin 点サイズ')
+        self.co_point_size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.co_point_size_slider.setRange(4, 30)
+        self.co_point_size_slider.setValue(self.co_point_size_value)
+        self.co_point_size_slider.valueChanged.connect(self._on_co_point_size_changed)
+        co_point_size_row.addWidget(self.co_point_size_label)
+        co_point_size_row.addWidget(self.co_point_size_slider, 1)
+        left_layout.addLayout(co_point_size_row)
+
         self.metrics_label = QLabel('距離計算\n- Clamp XY平面→U軸: --\n- W円面→Clamp中心面: --\n- CseX軸と直動X軸: --\n- CseY軸と直動Y軸: --\n- CseZ軸と直動Z軸: --')
         self.metrics_label.setWordWrap(True)
         self._apply_theme_dependent_styles()
@@ -292,11 +330,53 @@ class Tab1Widget(QWidget):
         if isinstance(model, str) and QColor(model).isValid():
             self.model_color = QColor(model).name()
 
+    def _load_lse_value(self) -> float:
+        settings = load_settings() or {}
+        tab1 = settings.get('tab1') or {}
+        try:
+            return float(tab1.get('lse_value', 0.0))
+        except Exception:
+            return 0.0
+
+    def _load_point_size_value(self) -> int:
+        settings = load_settings() or {}
+        tab1 = settings.get('tab1') or {}
+        try:
+            return int(tab1.get('point_size_value', 12))
+        except Exception:
+            return 12
+
+    def _load_co_point_size_value(self) -> int:
+        settings = load_settings() or {}
+        tab1 = settings.get('tab1') or {}
+        try:
+            return int(tab1.get('co_point_size_value', 12))
+        except Exception:
+            return 12
+
     def _save_visual_settings(self):
         settings = load_settings() or {}
         tab1 = settings.setdefault('tab1', {})
         tab1['background_color'] = self.background_color
         tab1['model_color'] = self.model_color
+        save_settings(settings)
+
+    def _save_lse_value(self, value: float):
+        settings = load_settings() or {}
+        tab1 = settings.setdefault('tab1', {})
+        tab1['lse_value'] = float(value)
+        save_settings(settings)
+
+    def _save_point_size_value(self, value: int):
+        settings = load_settings() or {}
+        tab1 = settings.setdefault('tab1', {})
+        tab1['point_size_value'] = int(value)
+        save_settings(settings)
+
+    def _save_co_point_size_value(self, value: int):
+        settings = load_settings() or {}
+        tab1 = settings.setdefault('tab1', {})
+        tab1['co_point_size_value'] = int(value)
         save_settings(settings)
 
     def _update_color_preview_labels(self):
@@ -730,7 +810,25 @@ class Tab1Widget(QWidget):
         tab1['stl_path'] = self.current_path or tab1.get('stl_path', '')
         tab1['selected_mode'] = self.selected_mode
         tab1['mode_points'] = self._serialize_mode_points()
+        tab1['lse_value'] = float(self.lse_spin.value()) if hasattr(self, 'lse_spin') else float(getattr(self, 'lse_value', 0.0))
+        tab1['point_size_value'] = int(self.point_size_slider.value()) if hasattr(self, 'point_size_slider') else int(getattr(self, 'point_size_value', 12))
+        tab1['co_point_size_value'] = int(self.co_point_size_slider.value()) if hasattr(self, 'co_point_size_slider') else int(getattr(self, 'co_point_size_value', 12))
         save_settings(settings)
+
+    def _on_lse_value_changed(self, value):
+        self.lse_value = float(value)
+        self._save_lse_value(self.lse_value)
+        self._render_mode_points()
+
+    def _on_point_size_changed(self, value):
+        self.point_size_value = int(value)
+        self._save_point_size_value(self.point_size_value)
+        self._render_mode_points()
+
+    def _on_co_point_size_changed(self, value):
+        self.co_point_size_value = int(value)
+        self._save_co_point_size_value(self.co_point_size_value)
+        self._render_mode_points()
 
     def _load_points_cache_for_current_path(self):
         settings = load_settings() or {}
@@ -1351,6 +1449,8 @@ class Tab1Widget(QWidget):
             'mode_measure::w_clamp_center',
             'mode_measure_points::u_clamp_xy',
             'mode_measure_points::w_clamp_center',
+            'mode_co_origin::lse',
+            'mode_labels::co_origin',
             'selected_point',
         ):
             try:
@@ -1373,7 +1473,7 @@ class Tab1Widget(QWidget):
                 pv.PolyData(arr),
                 name=f"mode_points::{mode}",
                 color=self.mode_colors.get(mode, '#ffffff'),
-                point_size=16 if is_selected_mode else 12,
+                point_size=max(1, int(self.point_size_slider.value()) + 4 if is_selected_mode else int(self.point_size_slider.value())),
                 render_points_as_spheres=True,
                 style='points',
                 pickable=False,
@@ -1525,7 +1625,7 @@ class Tab1Widget(QWidget):
                 pv.PolyData(np.array([l_pt, m_pt, n_pt], dtype=float)),
                 name='mode_points::auto_lmn',
                 color=self.clamp_lmn_color,
-                point_size=14,
+                point_size=max(1, int(self.point_size_slider.value()) + 2),
                 render_points_as_spheres=True,
                 style='points',
                 pickable=False,
@@ -1640,13 +1740,14 @@ class Tab1Widget(QWidget):
 
         self.metrics_label.setText(
             '距離計算\n'
-            f'- Clamp XY平面→U軸: {_fmt(d_u_clamp_xy)}\n'
-            f'- W円面→Clamp中心面: {_fmt(d_w_circle_clamp_center)}\n'
             f'- CseX軸と直動X軸: {_format_rotation_angle(angle_cse_x, "W")}\n'
             f'- CseY軸と直動Y軸: {_format_rotation_angle(angle_v_y, "V")}\n'
             f'- CseZ軸と直動Z軸: {_format_rotation_angle(angle_w_z, "U")}\n'
             '※右ネジ方向を正\n'
-            '※足りない / 行き過ぎ　が正しく動作するかは未検討'
+            '※足りない / 行き過ぎ　が正しく動作するかは未検討\n\n'
+            '（参考）\n'
+            f'- Clamp XY平面→U軸: {_fmt(d_u_clamp_xy)}\n'
+            f'- W円面→Clamp中心面: {_fmt(d_w_circle_clamp_center)}'
         )
 
         # 右画面にも距離テキストを表示
@@ -1676,7 +1777,7 @@ class Tab1Widget(QWidget):
                     pv.PolyData(np.array([p0, p1], dtype=float)),
                     name='mode_measure_points::u_clamp_xy',
                     color='#8ce99a',
-                    point_size=11,
+                    point_size=max(1, int(self.point_size_slider.value())),
                     render_points_as_spheres=True,
                     style='points',
                     pickable=False,
@@ -1701,13 +1802,48 @@ class Tab1Widget(QWidget):
                     pv.PolyData(np.array([w_center, w_proj], dtype=float)),
                     name='mode_measure_points::w_clamp_center',
                     color='#ff922b',
-                    point_size=12,
+                    point_size=max(1, int(self.point_size_slider.value())),
                     render_points_as_spheres=True,
                     style='points',
                     pickable=False,
                     reset_camera=False,
                     render=False,
                 )
+
+        if w_axis is not None and w_circle_plane is not None:
+            # Co_Origin: W surface を基準 (0) として、Lse 分だけ W ベクトルの正方向へ移動した点
+            lse_offset = float(self.lse_spin.value()) if hasattr(self, 'lse_spin') else float(getattr(self, 'lse_value', 0.0))
+            w_point = np.array(w_circle_plane['point'], dtype=float)
+            w_dir = self._normalize(np.array(w_axis['dir'], dtype=float))
+            if w_dir is None:
+                w_dir = np.array(w_axis['dir'], dtype=float)
+            co_origin = w_point + lse_offset * w_dir
+            # Co_Origin sphere radius: make minimal size similar to other points
+            co_scale = float(self.co_point_size_slider.value()) / 12.0 if hasattr(self, 'co_point_size_slider') else float(getattr(self, 'co_point_size_value', 12)) / 12.0
+            # Base world-size factor is small so minimum appears comparable to point-size rendering
+            co_radius = float(np.clip(diag * 0.002 * co_scale, 0.8, max(4.0, diag * 0.05)))
+            self.plotter.add_mesh(
+                pv.Sphere(center=co_origin, radius=co_radius, theta_resolution=24, phi_resolution=24),
+                name='mode_co_origin::lse',
+                color='#ffd166',
+                opacity=1.0,
+                pickable=False,
+                reset_camera=False,
+                render=False,
+            )
+            self.plotter.add_point_labels(
+                np.array([co_origin], dtype=float),
+                ['Co_Origin'],
+                name='mode_labels::co_origin',
+                text_color='#ffd166',
+                font_size=13,
+                always_visible=True,
+                fill_shape=True,
+                shape_opacity=0.20,
+                margin=4,
+                reset_camera=False,
+                render=False,
+            )
 
         if dist_points:
             self.plotter.add_point_labels(
@@ -1780,7 +1916,7 @@ class Tab1Widget(QWidget):
                 pv.PolyData(sel),
                 name='selected_point',
                 color='#ffff66',
-                point_size=18,
+                point_size=max(1, int(self.point_size_slider.value()) + 6),
                 render_points_as_spheres=True,
                 style='points',
                 pickable=False,
