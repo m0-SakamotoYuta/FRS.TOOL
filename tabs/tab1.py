@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QColorDialog,
     QDoubleSpinBox,
+    QSpinBox,
     QSlider,
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread, QEvent
@@ -70,6 +71,7 @@ class Tab1Widget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
 
         self.current_path = ''
         self.current_mesh = None
@@ -245,8 +247,15 @@ class Tab1Widget(QWidget):
         self.point_size_slider.setRange(4, 30)
         self.point_size_slider.setValue(self.point_size_value)
         self.point_size_slider.valueChanged.connect(self._on_point_size_changed)
+        self.point_size_spin = QSpinBox()
+        self.point_size_spin.setRange(4, 30)
+        self.point_size_spin.setValue(self.point_size_value)
+        self.point_size_spin.setMinimumWidth(60)
+        self.point_size_slider.valueChanged.connect(self.point_size_spin.setValue)
+        self.point_size_spin.valueChanged.connect(self.point_size_slider.setValue)
         point_size_row.addWidget(self.point_size_label)
         point_size_row.addWidget(self.point_size_slider, 1)
+        point_size_row.addWidget(self.point_size_spin)
         left_layout.addLayout(point_size_row)
 
         co_point_size_row = QHBoxLayout()
@@ -255,8 +264,15 @@ class Tab1Widget(QWidget):
         self.co_point_size_slider.setRange(4, 30)
         self.co_point_size_slider.setValue(self.co_point_size_value)
         self.co_point_size_slider.valueChanged.connect(self._on_co_point_size_changed)
+        self.co_point_size_spin = QSpinBox()
+        self.co_point_size_spin.setRange(4, 30)
+        self.co_point_size_spin.setValue(self.co_point_size_value)
+        self.co_point_size_spin.setMinimumWidth(60)
+        self.co_point_size_slider.valueChanged.connect(self.co_point_size_spin.setValue)
+        self.co_point_size_spin.valueChanged.connect(self.co_point_size_slider.setValue)
         co_point_size_row.addWidget(self.co_point_size_label)
         co_point_size_row.addWidget(self.co_point_size_slider, 1)
+        co_point_size_row.addWidget(self.co_point_size_spin)
         left_layout.addLayout(co_point_size_row)
 
         self.metrics_label = QLabel('距離計算\n- Clamp XY平面→U軸: --\n- W円面→Clamp中心面: --\n- CseX軸と直動X軸: --\n- CseY軸と直動Y軸: --\n- CseZ軸と直動Z軸: --')
@@ -901,6 +917,40 @@ class Tab1Widget(QWidget):
             return
         self._save_cached_stl_path(path)
         self._start_load(path, show_dialog=True)
+
+    # === Drag & Drop (Windows / Linux 共通: ファイル URL を受ける) ===
+    def _extract_stl_paths_from_event(self, event):
+        md = event.mimeData()
+        if not md.hasUrls():
+            return []
+        paths = []
+        for url in md.urls():
+            p = url.toLocalFile()
+            if p and p.lower().endswith('.stl') and os.path.isfile(p):
+                paths.append(p)
+        return paths
+
+    def dragEnterEvent(self, event):
+        if self._extract_stl_paths_from_event(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._extract_stl_paths_from_event(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        paths = self._extract_stl_paths_from_event(event)
+        if not paths:
+            event.ignore()
+            return
+        path = paths[0]
+        self._save_cached_stl_path(path)
+        self._start_load(path, show_dialog=True)
+        event.acceptProposedAction()
 
     def on_reload_cached(self):
         path = self._get_cached_stl_path()
