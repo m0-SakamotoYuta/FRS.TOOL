@@ -143,7 +143,7 @@ class Tab1Widget(QWidget):
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        title = QLabel('0点校正')
+        title = QLabel('Ver. 1')
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_layout.addWidget(title)
 
@@ -455,6 +455,33 @@ class Tab1Widget(QWidget):
             self.metrics_label.setStyleSheet('font-size: 16px; font-weight: 600; color: #273043;')
             if hasattr(self, 'mode_scroll'):
                 self.mode_scroll.setStyleSheet('QScrollArea { border: 1px solid #c7ced8; border-radius: 8px; background: #f7f9fc; }')
+
+    def cleanup(self):
+        if getattr(self, 'loading_dialog', None) is not None:
+            try:
+                self.loading_dialog.close()
+            except Exception:
+                pass
+
+        plotter = getattr(self, 'plotter', None)
+        if plotter is not None:
+            try:
+                plotter.close()
+            except Exception:
+                pass
+            try:
+                plotter.deleteLater()
+            except Exception:
+                pass
+            self.plotter = None
+
+        thread = getattr(self, 'thread', None)
+        if thread is not None:
+            try:
+                thread.quit()
+                thread.wait(1000)
+            except Exception:
+                pass
 
     def changeEvent(self, event):
         super().changeEvent(event)

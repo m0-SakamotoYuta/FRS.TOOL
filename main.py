@@ -20,12 +20,24 @@ class MainWindow(QMainWindow):
 		self.setWindowTitle('FRS Simulator - Main GUI')
 		self.resize(800, 600)
 
-		tabs = QTabWidget()
-		tabs.addTab(Tab1Widget(), '0点校正')
-		tabs.addTab(Tab2Widget(), 'タブ2')
-		tabs.addTab(Tab3Widget(), 'タブ3')
-		tabs.addTab(Tab4Widget(), '設定')
-		self.setCentralWidget(tabs)
+		self.tabs = QTabWidget()
+		self.tab1 = Tab1Widget()
+		self.tab2 = Tab2Widget()
+		self.tabs.addTab(self.tab1, 'Ver. 1')
+		self.tabs.addTab(self.tab2, 'Ver. 2（実用）')
+		self.tabs.addTab(Tab3Widget(), 'タブ3')
+		self.tabs.addTab(Tab4Widget(), '設定')
+		self.setCentralWidget(self.tabs)
+
+	def closeEvent(self, event):
+		for widget in (getattr(self, 'tab1', None), getattr(self, 'tab2', None)):
+			cleanup = getattr(widget, 'cleanup', None)
+			if callable(cleanup):
+				try:
+					cleanup()
+				except Exception:
+					pass
+		super().closeEvent(event)
 
 
 def main():
