@@ -14,7 +14,7 @@ try:
 except Exception:
     HAS_PYVISTA = False
 
-from tabs.settings import load_settings
+from tabs.settings import load_settings, save_settings
 
 
 class STLLoadWorker(QObject):
@@ -175,35 +175,30 @@ class Tab2Widget(QWidget):
         return widget
     
     def _create_u_axis_tab(self) -> QWidget:
-        """U axis タブを作成。姿勢ラジオボタンと、各姿勢の STL読み込み + 3D表示。"""
+        """U axis タブを作成。姿勢ごとに独立した STL/点群/C_u-axis を持つ。"""
         widget = QWidget()
         main_layout = QVBoxLayout(widget)
-        
-        # U axis タイトル
+
         title = QLabel('U axis')
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet('font-weight: bold; font-size: 12px;')
         main_layout.addWidget(title)
-        
-        # 姿勢ごとの STL ロード + 3D表示エリア（タブウィジェット）
+
         self.posture_subtabs = QTabWidget()
         postures = [
-            ('姿勢1', '例：0°'),
-            ('姿勢2', '例：45°'),
-            ('姿勢3', '例：90°'),
+            ('姿勢1', '例：0°', 'posture1'),
+            ('姿勢2', '例：45°', 'posture2'),
+            ('姿勢3', '例：90°', 'posture3'),
         ]
         self.posture_widgets = {}
-        
-        for posture_label, example_text in postures:
-            if posture_label == '姿勢1':
-                posture_widget = self._create_posture1_view_widget(posture_label, example_text)
-            else:
-                posture_widget = self._create_posture_view_widget(posture_label, example_text)
+
+        for posture_label, example_text, posture_key in postures:
+            posture_widget = self._create_posture_view_widget(posture_label, example_text, posture_key)
             self.posture_widgets[posture_label] = posture_widget
             self.posture_subtabs.addTab(posture_widget, posture_label)
-        
+
         main_layout.addWidget(self.posture_subtabs, 1)
-        
+
         return widget
 
     def _create_plane_point_controls_widget(self, plane_label: str, plane_title: str) -> QWidget:
@@ -226,40 +221,58 @@ class Tab2Widget(QWidget):
         widget.point_add_enabled = False
         return widget
 
-    def _create_posture1_view_widget(self, posture_label: str, example_text: str) -> QWidget:
+    def _create_posture_view_widget(self, posture_label: str, example_text: str, posture_key: str) -> QWidget:
         widget = QWidget()
+        widget.posture_key = posture_key
+        # 'posture1' → 'C_u-axis_posi1' のように座標系名を組み立てる
+        widget.c_u_axis_name = f'C_u-axis_{posture_key.replace("posture", "posi")}'
         main_layout = QVBoxLayout(widget)
+
+        # Ver.1 風レイアウト: 上段 = 左コントロール + 右 3D ビュー、下段 = ログ
+        top_layout = QHBoxLayout()
+
+        # === 左パネル: タイトル / 読み込み / 軸 / 平面サブタブ ===
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(4, 4, 4, 4)
 
         title = QLabel(f'{posture_label}  {example_text}')
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet('font-weight: bold; font-size: 12px;')
-        main_layout.addWidget(title)
+        left_layout.addWidget(title)
 
         load_btn = QPushButton('STLを読み込む')
-        main_layout.addWidget(load_btn)
+        left_layout.addWidget(load_btn)
 
-        log_view = QTextEdit()
-        log_view.setReadOnly(True)
-        log_view.setPlaceholderText('ログ')
-        log_view.setMinimumHeight(80)
-        log_view.setMaximumHeight(140)
-        main_layout.addWidget(log_view)
+        build_axis_btn = QPushButton('C_u-axis 座標系を生成')
+        build_axis_btn.setEnabled(False)
+        left_layout.addWidget(build_axis_btn)
 
-        # 単一の共有 3D ビュー（タブ切替で変化しない）
+        clear_axis_btn = QPushButton('C_u-axis 座標系を消去')
+        clear_axis_btn.setEnabled(False)
+        left_layout.addWidget(clear_axis_btn)
+
+        # === 右パネル: 共有 3D ビュー ===
         if HAS_PYVISTA:
             plotter = QtInteractor(widget)
             background_color, _ = self._load_visual_settings()
             plotter.set_background(background_color, top=self._background_top_color(background_color))
             plotter.add_text('STLを読み込んでください', position='upper_left', font_size=10)
             self._configure_lights(plotter)
-            main_layout.addWidget(plotter.interactor, 3)
+            right_view = plotter.interactor
         else:
             plotter = None
-            fallback = QLabel('pyvista / pyvistaqt が未インストール')
-            fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            main_layout.addWidget(fallback, 3)
+            right_view = QLabel('pyvista / pyvistaqt が未インストール')
+            right_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         widget.plotter = plotter
+
+        # === 下段: ログビュー（全幅） ===
+        log_view = QTextEdit()
+        log_view.setReadOnly(True)
+        log_view.setPlaceholderText('ログ')
+        log_view.setMinimumHeight(120)
+        log_view.setMaximumHeight(220)
 
         # 平面サブタブ（点コントロールのみ。3D ビューは共有）
         plane_subtabs = QTabWidget()
@@ -284,17 +297,37 @@ class Tab2Widget(QWidget):
             plane_subtabs.addTab(plane_widget, plane_label)
             plane_widgets.append(plane_widget)
 
-        main_layout.addWidget(plane_subtabs, 2)
+        left_layout.addWidget(plane_subtabs, 1)
+        left_layout.addStretch()
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left_panel)
+        left_scroll.setMinimumWidth(280)
+        left_scroll.setMaximumWidth(420)
+
+        top_layout.addWidget(left_scroll, 1)
+        top_layout.addWidget(right_view, 4)
+
+        main_layout.addLayout(top_layout, 5)
+        main_layout.addWidget(log_view, 1)
 
         widget.load_btn = load_btn
+        widget.build_axis_btn = build_axis_btn
+        widget.clear_axis_btn = clear_axis_btn
         widget.log_view = log_view
         widget.plane_widgets = plane_widgets
         widget.current_mesh = None
+        widget.c_u_axis = None
         self.visual_widgets.append(widget)
 
-        def _start_load(path: str):
+        def _start_load(path: str, preserve_state: bool = False):
+            widget._next_load_preserve = preserve_state
+            widget._pending_load_path = path
             widget.log_view.setText('')
-            widget.log_view.append(f'読込要求: {path}')
+            widget.log_view.append(
+                f'読込要求: {path}' + ('（キャッシュ復元）' if preserve_state else '')
+            )
             widget.load_btn.setEnabled(False)
 
             widget.thread = QThread(widget)
@@ -315,27 +348,49 @@ class Tab2Widget(QWidget):
             widget.thread.start()
 
         def _on_mesh_loaded(mesh):
+            preserve = bool(getattr(widget, '_next_load_preserve', False))
+            widget._next_load_preserve = False
             widget.current_mesh = mesh
+            widget.stl_path = getattr(widget, '_pending_load_path', None) or getattr(widget, 'stl_path', None)
             widget.log_view.append('表示を更新します...')
 
-            for plane_widget in widget.plane_widgets:
-                plane_widget.current_mesh = mesh
-                plane_widget.points.clear()
-                plane_widget.selected_point_index = -1
-                plane_widget.point_add_enabled = False
-                plane_widget.point_add_btn.setChecked(False)
-                plane_widget.point_add_btn.setEnabled(True)
-                plane_widget._refresh_point_list()
+            if not preserve:
+                widget.c_u_axis = None
+                for plane_widget in widget.plane_widgets:
+                    plane_widget.current_mesh = mesh
+                    plane_widget.points.clear()
+                    plane_widget.selected_point_index = -1
+                    plane_widget.point_add_enabled = False
+                    plane_widget.point_add_btn.setChecked(False)
+                    plane_widget.point_add_btn.setEnabled(True)
+                    plane_widget._refresh_point_list()
+            else:
+                # キャッシュから復元した点群・座標系を保ち、メッシュだけ差し替える
+                for plane_widget in widget.plane_widgets:
+                    plane_widget.current_mesh = mesh
+                    plane_widget.point_add_enabled = False
+                    plane_widget.point_add_btn.setChecked(False)
+                    plane_widget.point_add_btn.setEnabled(True)
+                    if plane_widget.points:
+                        plane_widget.selected_point_index = len(plane_widget.points) - 1
+                    else:
+                        plane_widget.selected_point_index = -1
+                    plane_widget._refresh_point_list()
 
             self._render_posture1_plotter(widget, reset_view=True)
+            widget.build_axis_btn.setEnabled(True)
+            widget.clear_axis_btn.setEnabled(widget.c_u_axis is not None)
             widget.log_view.append('完了')
             widget.load_btn.setEnabled(True)
+            self._save_posture_cache(widget)
 
         def _on_load_error(msg: str):
             widget.log_view.append(msg)
             widget.load_btn.setEnabled(True)
 
-        load_btn.clicked.connect(lambda: self._open_posture1_file(widget))
+        load_btn.clicked.connect(lambda: self._open_posture_file(widget))
+        build_axis_btn.clicked.connect(lambda: self._build_c_u_axis(widget))
+        clear_axis_btn.clicked.connect(lambda: self._clear_c_u_axis(widget))
 
         widget._start_load = _start_load
         widget._on_mesh_loaded = _on_mesh_loaded
@@ -374,6 +429,18 @@ class Tab2Widget(QWidget):
 
         widget._on_plane_subtab_changed = _on_plane_subtab_changed
         plane_subtabs.currentChanged.connect(_on_plane_subtab_changed)
+
+        # キャッシュ（点群・C_u-axis・STLパス）を復元。STL があれば自動読込。
+        widget.stl_path = None
+        cached_stl_path = self._load_posture_cache(widget)
+        for plane_widget in plane_widgets:
+            plane_widget._refresh_point_list()
+        if cached_stl_path and os.path.exists(cached_stl_path):
+            widget.log_view.append(f'キャッシュ検出: {cached_stl_path}')
+            widget._start_load(cached_stl_path, preserve_state=True)
+        elif cached_stl_path:
+            widget.log_view.append(f'前回のSTLが見つかりません: {cached_stl_path}')
+
         return widget
 
     def _add_plane_point_controls(self, widget, left_layout):
@@ -472,6 +539,7 @@ class Tab2Widget(QWidget):
                 widget.selected_point_index = min(widget.selected_point_index, len(points) - 1)
                 _refresh_point_list()
                 widget.posture_widget._refresh_all_plane_views(reset_view=False)
+                self._save_posture_cache(widget.posture_widget)
 
         def _on_delete_last():
             points = getattr(widget, 'points', [])
@@ -480,12 +548,14 @@ class Tab2Widget(QWidget):
                 widget.selected_point_index = min(widget.selected_point_index, len(points) - 1)
                 _refresh_point_list()
                 widget.posture_widget._refresh_all_plane_views(reset_view=False)
+                self._save_posture_cache(widget.posture_widget)
 
         def _on_clear_points():
             widget.points.clear()
             widget.selected_point_index = -1
             _refresh_point_list()
             widget.posture_widget._refresh_all_plane_views(reset_view=False)
+            self._save_posture_cache(widget.posture_widget)
 
         def _on_point_picked(row: int):
             widget.selected_point_index = row
@@ -532,6 +602,7 @@ class Tab2Widget(QWidget):
         )
         widget._refresh_point_list()
         widget.posture_widget._refresh_all_plane_views(reset_view=False)
+        self._save_posture_cache(widget.posture_widget)
 
     def _render_posture1_plotter(self, posture_widget, reset_view: bool = False):
         plotter = getattr(posture_widget, 'plotter', None)
@@ -640,6 +711,8 @@ class Tab2Widget(QWidget):
             except Exception:
                 pass
 
+        self._draw_c_u_axis(posture_widget)
+
         if reset_view:
             plotter.reset_camera(bounds=posture_widget.current_mesh.bounds)
         elif camera_position is not None:
@@ -718,124 +791,307 @@ class Tab2Widget(QWidget):
             j_resolution=1,
         )
 
-    def _open_posture1_file(self, widget):
+    def _save_posture_cache(self, posture_widget):
+        """姿勢ごとの点群・C_u-axis・STL パスをユーザー設定に保存する。"""
+        posture_key = getattr(posture_widget, 'posture_key', None)
+        if not posture_key:
+            return
+        try:
+            settings = load_settings() or {}
+            tab2 = settings.setdefault('tab2', {})
+            u_axis = tab2.setdefault('u_axis', {})
+            posture_entry = u_axis.setdefault(posture_key, {})
+
+            stl_path = getattr(posture_widget, 'stl_path', None)
+            if stl_path:
+                posture_entry['stl_path'] = stl_path
+            else:
+                posture_entry.pop('stl_path', None)
+
+            points_serialized = {}
+            for plane_label, pts in posture_widget.shared_points.items():
+                points_serialized[plane_label] = [
+                    [float(p[0]), float(p[1]), float(p[2])] for p in pts
+                ]
+            posture_entry['points'] = points_serialized
+
+            c_u_axis = getattr(posture_widget, 'c_u_axis', None)
+            if c_u_axis is not None:
+                posture_entry['c_u_axis'] = {
+                    key: np.asarray(c_u_axis[key], dtype=float).tolist()
+                    for key in ('origin', 'ex', 'ey', 'ez', 'raw_x', 'raw_y', 'raw_z')
+                }
+            else:
+                posture_entry.pop('c_u_axis', None)
+
+            save_settings(settings)
+        except Exception:
+            pass
+
+    def _load_posture_cache(self, posture_widget):
+        """設定から姿勢の状態を取り出す。点群と C_u-axis はその場で復元する。
+
+        STL パス（あれば）は呼び出し側で `_start_load(path, preserve_state=True)` する。
+        """
+        posture_key = getattr(posture_widget, 'posture_key', None)
+        if not posture_key:
+            return ''
+        try:
+            settings = load_settings() or {}
+            posture_entry = (
+                ((settings.get('tab2') or {}).get('u_axis') or {}).get(posture_key) or {}
+            )
+        except Exception:
+            return ''
+
+        cached_points = posture_entry.get('points') or {}
+        for plane_label, plane_pts in posture_widget.shared_points.items():
+            plane_pts.clear()
+            for raw in (cached_points.get(plane_label) or []):
+                if isinstance(raw, (list, tuple)) and len(raw) == 3:
+                    try:
+                        plane_pts.append(np.array(raw, dtype=float))
+                    except Exception:
+                        continue
+
+        cached_axis = posture_entry.get('c_u_axis')
+        if isinstance(cached_axis, dict):
+            try:
+                posture_widget.c_u_axis = {
+                    key: np.array(cached_axis[key], dtype=float)
+                    for key in ('origin', 'ex', 'ey', 'ez', 'raw_x', 'raw_y', 'raw_z')
+                }
+            except Exception:
+                posture_widget.c_u_axis = None
+        else:
+            posture_widget.c_u_axis = None
+
+        return str(posture_entry.get('stl_path') or '')
+
+    def _build_c_u_axis(self, posture_widget):
+        """3 平面からローカル座標系 C_u-axis を構築する。
+
+        表示する 3 本のベクトルは「平面ペアの交線」:
+          X 軸 (赤) = 平面1 ∩ 平面3 の方向（= n_3 × n_1）
+          Y 軸 (青) = 平面1 ∩ 平面2 の方向（= n_1 × n_2）
+          Z 軸 (緑) = 平面2 ∩ 平面3 の方向（= n_2 × n_3）
+
+        計測誤差で 3 本は厳密には直交しないため、これらを最近接の直交行列へ
+        正規直交化したものを `ex/ey/ez` として保存（実際の座標系として利用）。
+        生の交線は `raw_x/raw_y/raw_z` に保持し、表示にはこちらを使う。
+        """
+        log = posture_widget.log_view
+        plane_keys = ['平面1（XY平面）', '平面2（YZ平面）', '平面3（ZX平面）']
+
+        pts_lists = []
+        for i, key in enumerate(plane_keys, 1):
+            pts = list(posture_widget.shared_points.get(key, []))
+            if len(pts) < 3:
+                log.append(f'C_u-axis: 平面{i}には3点以上が必要です（現在 {len(pts)} 点）。')
+                return
+            pts_lists.append(np.array(pts, dtype=float))
+
+        centroids = []
+        normals = []
+        for i, arr in enumerate(pts_lists, 1):
+            fit = self._fit_plane_basis(arr)
+            if fit is None:
+                log.append(f'C_u-axis: 平面{i}のフィッティングに失敗しました。')
+                return
+            c, n, _u, _v = fit
+            centroids.append(c)
+            normals.append(np.array(n, dtype=float))
+
+        # 法線の符号正規化：各 n_i を「他 2 平面の点群の重心」へ向ける
+        for i in range(3):
+            others = np.vstack([pts_lists[j] for j in range(3) if j != i])
+            ref_dir = others.mean(axis=0) - centroids[i]
+            if np.dot(normals[i], ref_dir) < 0:
+                normals[i] = -normals[i]
+
+        n1, n2, n3 = normals
+        c1, c2, c3 = centroids
+
+        # 原点：n_i・x = n_i・c_i の連立解
+        A = np.vstack([n1, n2, n3])
+        d = np.array([np.dot(n1, c1), np.dot(n2, c2), np.dot(n3, c3)])
+        try:
+            origin = np.linalg.solve(A, d)
+        except np.linalg.LinAlgError:
+            log.append('C_u-axis: 3 平面の交点が一意に決まりません（平面が平行または一次従属です）。')
+            return
+
+        def _safe_normalize(v, name):
+            n = np.linalg.norm(v)
+            if n < 1e-9:
+                log.append(f'C_u-axis: {name} を構築できません（平面の法線が平行）。')
+                return None
+            return v / n
+
+        # 平面ペアの交線（ユーザー指定の対応関係 + 理想直交時に正の向きになる符号順）
+        raw_x = _safe_normalize(np.cross(n3, n1), 'X 軸')   # 平面1 ∩ 平面3
+        raw_y = _safe_normalize(np.cross(n1, n2), 'Y 軸')   # 平面1 ∩ 平面2
+        raw_z = _safe_normalize(np.cross(n2, n3), 'Z 軸')   # 平面2 ∩ 平面3
+        if raw_x is None or raw_y is None or raw_z is None:
+            return
+
+        # 最近接の正規直交行列（極分解 / Procrustes）。3 本の交線が厳密に直交
+        # しない場合でも、ノルム保存最小ずれの直交フレームを得る。
+        M = np.column_stack([raw_x, raw_y, raw_z])
+        U, _, Vt = np.linalg.svd(M)
+        R = U @ Vt
+        if np.linalg.det(R) < 0:
+            U[:, -1] = -U[:, -1]
+            R = U @ Vt
+        e_x = R[:, 0]
+        e_y = R[:, 1]
+        e_z = R[:, 2]
+
+        # ユーザー要求: X 軸と Z 軸を反転（Y はそのまま、右手系は保たれる）
+        e_x = -e_x
+        e_z = -e_z
+        raw_x = -raw_x
+        raw_z = -raw_z
+
+        def _deg(v, w):
+            return float(np.degrees(np.arccos(np.clip(float(np.dot(v, w)), -1.0, 1.0))))
+
+        posture_widget.c_u_axis = {
+            'origin': origin,
+            'ex': e_x, 'ey': e_y, 'ez': e_z,
+            'raw_x': raw_x, 'raw_y': raw_y, 'raw_z': raw_z,
+        }
+
+        log.append('C_u-axis 座標系を構築しました:')
+        log.append(f'  原点 O = ({origin[0]:.3f}, {origin[1]:.3f}, {origin[2]:.3f})')
+        log.append('  [直交化前: 生の平面交線]')
+        log.append(f'    X_raw(平面1∩平面3) = ({raw_x[0]:+.4f}, {raw_x[1]:+.4f}, {raw_x[2]:+.4f})')
+        log.append(f'    Y_raw(平面1∩平面2) = ({raw_y[0]:+.4f}, {raw_y[1]:+.4f}, {raw_y[2]:+.4f})')
+        log.append(f'    Z_raw(平面2∩平面3) = ({raw_z[0]:+.4f}, {raw_z[1]:+.4f}, {raw_z[2]:+.4f})')
+        log.append(
+            f'    角度（理想 90°）: '
+            f'∠(X_raw, Y_raw) = {_deg(raw_x, raw_y):.4f}°, '
+            f'∠(Y_raw, Z_raw) = {_deg(raw_y, raw_z):.4f}°, '
+            f'∠(Z_raw, X_raw) = {_deg(raw_z, raw_x):.4f}°'
+        )
+        log.append('  [直交化後: C_u-axis 基底（表示ベクトル）]')
+        log.append(f'    X(赤) e_x = ({e_x[0]:+.4f}, {e_x[1]:+.4f}, {e_x[2]:+.4f})')
+        log.append(f'    Y(青) e_y = ({e_y[0]:+.4f}, {e_y[1]:+.4f}, {e_y[2]:+.4f})')
+        log.append(f'    Z(緑) e_z = ({e_z[0]:+.4f}, {e_z[1]:+.4f}, {e_z[2]:+.4f})')
+        log.append(
+            f'    角度（厳密 90°）: '
+            f'∠(e_x, e_y) = {_deg(e_x, e_y):.4f}°, '
+            f'∠(e_y, e_z) = {_deg(e_y, e_z):.4f}°, '
+            f'∠(e_z, e_x) = {_deg(e_z, e_x):.4f}°'
+        )
+
+        posture_widget.clear_axis_btn.setEnabled(True)
+        self._render_posture1_plotter(posture_widget, reset_view=False)
+        self._save_posture_cache(posture_widget)
+
+    def _clear_c_u_axis(self, posture_widget):
+        if getattr(posture_widget, 'c_u_axis', None) is None:
+            return
+        posture_widget.c_u_axis = None
+        posture_widget.clear_axis_btn.setEnabled(False)
+        posture_widget.log_view.append('C_u-axis 座標系を消去しました。')
+        self._render_posture1_plotter(posture_widget, reset_view=False)
+        self._save_posture_cache(posture_widget)
+
+    def _draw_c_u_axis(self, posture_widget):
+        plotter = getattr(posture_widget, 'plotter', None)
+        c_u_axis = getattr(posture_widget, 'c_u_axis', None)
+        if plotter is None or not HAS_PYVISTA:
+            return
+
+        # 既存アクターを除去（軸が消えた場合もクリアされる）
+        for name in ('c_u_axis_x', 'c_u_axis_y', 'c_u_axis_z', 'c_u_axis_origin', 'c_u_axis_label'):
+            try:
+                plotter.remove_actor(name)
+            except Exception:
+                pass
+
+        if c_u_axis is None:
+            return
+
+        mesh = posture_widget.current_mesh
+        if mesh is not None:
+            b = mesh.bounds
+            diag = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]]))
+        else:
+            diag = 100.0
+        axis_len = max(diag * 0.2, 1.0)
+
+        origin = c_u_axis['origin']
+        # 表示する 3 本のベクトルは SVD で正規直交化した C_u-axis 基底:
+        #   X 軸 (赤) = e_x
+        #   Y 軸 (青) = e_y
+        #   Z 軸 (緑) = e_z
+        # （これらは厳密に互いに直交し、ロボットアームのローカル座標系として使う）
+        for name, vec, color in (
+            ('c_u_axis_x', c_u_axis['ex'], '#ff3030'),
+            ('c_u_axis_y', c_u_axis['ey'], '#3060ff'),
+            ('c_u_axis_z', c_u_axis['ez'], '#30c030'),
+        ):
+            try:
+                arrow = pv.Arrow(
+                    start=origin,
+                    direction=vec,
+                    scale=axis_len,
+                    shaft_radius=0.015,
+                    tip_radius=0.045,
+                    tip_length=0.20,
+                )
+                plotter.add_mesh(
+                    arrow,
+                    name=name,
+                    color=color,
+                    pickable=False,
+                    reset_camera=False,
+                    render=False,
+                )
+            except Exception:
+                pass
+
+        try:
+            plotter.add_mesh(
+                pv.PolyData(np.array([origin], dtype=float)),
+                name='c_u_axis_origin',
+                color='#ffff66',
+                point_size=14,
+                render_points_as_spheres=True,
+                style='points',
+                pickable=False,
+                reset_camera=False,
+                render=False,
+            )
+        except Exception:
+            pass
+
+        # 座標系のラベル（例: 'C_u-axis_posi1'）を原点付近に 3D ラベルとして配置
+        label_text = getattr(posture_widget, 'c_u_axis_name', 'C_u-axis')
+        # 少し原点からオフセット（軸長の 10%）して可読性を上げる
+        label_offset = axis_len * 0.10
+        label_pos = np.array(origin, dtype=float) + np.array([label_offset, label_offset, label_offset], dtype=float)
+        try:
+            plotter.add_point_labels(
+                np.array([label_pos], dtype=float),
+                [label_text],
+                name='c_u_axis_label',
+                font_size=14,
+                text_color='#ffffaa',
+                point_size=0,
+                shape=None,
+                always_visible=True,
+                pickable=False,
+                reset_camera=False,
+                render=False,
+            )
+        except Exception:
+            pass
+
+    def _open_posture_file(self, widget):
         path, _ = QFileDialog.getOpenFileName(widget, 'STLファイルを開く', '', 'STL Files (*.stl)')
         if not path:
             return
         widget._start_load(path)
-    
-    def _create_posture_view_widget(self, posture_label: str, example_text: str) -> QWidget:
-        """各姿勢用の STL読み込み + 3D表示エリアを作成。"""
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        
-        # 左側：ボタンとログ
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        
-        load_btn = QPushButton(f'{posture_label}: STLを読み込む')
-        left_layout.addWidget(load_btn)
-        
-        log_view = QTextEdit()
-        log_view.setReadOnly(True)
-        log_view.setPlaceholderText('ログ')
-        log_view.setMinimumHeight(100)
-        left_layout.addWidget(log_view)
-        
-        left_panel.setMinimumWidth(200)
-        left_panel.setMaximumWidth(300)
-        
-        # 右側：3D表示
-        if HAS_PYVISTA:
-            plotter = QtInteractor(widget)
-            background_color, _ = self._load_visual_settings()
-            plotter.set_background(background_color, top=self._background_top_color(background_color))
-            plotter.add_text('STLを読み込んでください', position='upper_left', font_size=10)
-            self._configure_lights(plotter)
-            right_panel = plotter.interactor
-        else:
-            right_panel = QLabel('pyvista / pyvistaqt が未インストール')
-            right_panel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        layout.addWidget(left_panel, 0)
-        layout.addWidget(right_panel, 1)
-        
-        # データ保存用属性
-        widget.posture_label = posture_label
-        widget.load_btn = load_btn
-        widget.log_view = log_view
-        widget.plotter = plotter if HAS_PYVISTA else None
-        widget.current_mesh = None
-        
-        # ボタンクリック時の処理
-        def on_load_click():
-            path, _ = QFileDialog.getOpenFileName(widget, 'STLファイルを開く', '', 'STL Files (*.stl)')
-            if not path:
-                return
-            widget._start_load(path)
-        
-        load_btn.clicked.connect(on_load_click)
-        
-        # ロード処理メソッド
-        def _start_load(path: str):
-            widget.log_view.setText('')
-            widget.log_view.append(f'読込要求: {path}')
-            widget.load_btn.setEnabled(False)
-            
-            widget.thread = QThread(widget)
-            widget.worker = STLLoadWorker(path)
-            widget.worker.moveToThread(widget.thread)
-            
-            widget.thread.started.connect(widget.worker.run)
-            widget.worker.log.connect(lambda msg: widget.log_view.append(msg))
-            widget.worker.finished.connect(lambda mesh: _on_mesh_loaded(mesh))
-            widget.worker.error.connect(lambda msg: _on_load_error(msg))
-            
-            widget.worker.finished.connect(widget.thread.quit)
-            widget.worker.error.connect(widget.thread.quit)
-            widget.worker.finished.connect(widget.worker.deleteLater)
-            widget.worker.error.connect(widget.worker.deleteLater)
-            widget.thread.finished.connect(widget.thread.deleteLater)
-            
-            widget.thread.start()
-        
-        def _on_mesh_loaded(mesh):
-            widget.current_mesh = mesh
-            widget.log_view.append('表示を更新します...')
-            
-            if widget.plotter is not None:
-                try:
-                    widget.plotter.disable_picking()
-                except Exception:
-                    pass
-                widget.plotter.clear()
-                background_color, model_color = self._load_visual_settings()
-                widget.plotter.set_background(background_color, top=self._background_top_color(background_color))
-                self._configure_lights(widget.plotter)
-                widget.plotter.add_mesh(
-                    mesh,
-                    name='stl_model',
-                    color=model_color,
-                    show_edges=False,
-                    smooth_shading=True,
-                    ambient=0.15,
-                    diffuse=0.75,
-                    specular=0.35,
-                    specular_power=25.0,
-                )
-                widget.plotter.hide_axes()
-                widget.plotter.reset_camera(bounds=mesh.bounds)
-                widget.plotter.render()
-                widget.log_view.append('完了')
-            
-            widget.load_btn.setEnabled(True)
-        
-        def _on_load_error(msg: str):
-            widget.log_view.append(msg)
-            widget.load_btn.setEnabled(True)
-        
-        widget._start_load = _start_load
-        widget._on_mesh_loaded = _on_mesh_loaded
-        widget._on_load_error = _on_load_error
-        
-        return widget

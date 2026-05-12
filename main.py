@@ -27,6 +27,9 @@ class MainWindow(QMainWindow):
 		self.tabs.addTab(self.tab2, 'Ver. 2（実用）')
 		self.tabs.addTab(Tab3Widget(), 'タブ3')
 		self.tabs.addTab(Tab4Widget(), '設定')
+		self.tabs.setCurrentWidget(self.tab2)
+		if hasattr(self.tab2, 'posture_subtabs'):
+			self.tab2.posture_subtabs.setCurrentIndex(0)
 		self.setCentralWidget(self.tabs)
 
 	def closeEvent(self, event):
