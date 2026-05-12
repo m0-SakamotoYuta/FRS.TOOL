@@ -252,6 +252,14 @@ class Tab2Widget(QWidget):
         clear_axis_btn.setEnabled(False)
         left_layout.addWidget(clear_axis_btn)
 
+        build_world_btn = QPushButton('C_world 座標系を生成')
+        build_world_btn.setEnabled(False)
+        left_layout.addWidget(build_world_btn)
+
+        clear_world_btn = QPushButton('C_world 座標系を消去')
+        clear_world_btn.setEnabled(False)
+        left_layout.addWidget(clear_world_btn)
+
         # === 右パネル: 共有 3D ビュー ===
         if HAS_PYVISTA:
             plotter = QtInteractor(widget)
@@ -275,24 +283,32 @@ class Tab2Widget(QWidget):
         log_view.setMaximumHeight(220)
 
         # 平面サブタブ（点コントロールのみ。3D ビューは共有）
+        # 前半 3 タブが C_u-axis 用、後半 3 タブが C_world 用
         plane_subtabs = QTabWidget()
         widget.plane_subtabs = plane_subtabs
         plane_specs = [
-            ('平面1（XY平面）', 'XY平面'),
-            ('平面2（YZ平面）', 'YZ平面'),
-            ('平面3（ZX平面）', 'ZX平面'),
+            # (plane_label, plane_title, system_type)
+            ('平面1（XY平面）', 'XY平面 [C_u-axis 用]', 'c_u_axis'),
+            ('平面2（YZ平面）', 'YZ平面 [C_u-axis 用]', 'c_u_axis'),
+            ('平面3（ZX平面）', 'ZX平面 [C_u-axis 用]', 'c_u_axis'),
+            ('W平面1', 'W平面1 [C_world 用]', 'c_world'),
+            ('W平面2', 'W平面2 [C_world 用]', 'c_world'),
+            ('W平面3', 'W平面3 [C_world 用]', 'c_world'),
         ]
 
         plane_widgets = []
-        widget.shared_points = {}
+        widget.shared_points = {}        # C_u-axis 用
+        widget.shared_world_points = {}  # C_world 用
         widget.active_plane_index = 0
 
-        for plane_label, plane_title in plane_specs:
+        for plane_label, plane_title, system_type in plane_specs:
             plane_widget = self._create_plane_point_controls_widget(plane_label, plane_title)
             plane_widget.posture_widget = widget
             plane_widget.plotter = plotter  # 共有プロッタを参照
             plane_widget.log_view = log_view  # 共有ログ
-            plane_widget.points = widget.shared_points.setdefault(plane_label, [])
+            plane_widget.system_type = system_type
+            target_dict = widget.shared_points if system_type == 'c_u_axis' else widget.shared_world_points
+            plane_widget.points = target_dict.setdefault(plane_label, [])
             self._wire_plane_point_handlers(plane_widget)
             plane_subtabs.addTab(plane_widget, plane_label)
             plane_widgets.append(plane_widget)
@@ -315,10 +331,13 @@ class Tab2Widget(QWidget):
         widget.load_btn = load_btn
         widget.build_axis_btn = build_axis_btn
         widget.clear_axis_btn = clear_axis_btn
+        widget.build_world_btn = build_world_btn
+        widget.clear_world_btn = clear_world_btn
         widget.log_view = log_view
         widget.plane_widgets = plane_widgets
         widget.current_mesh = None
         widget.c_u_axis = None
+        widget.c_world = None
         self.visual_widgets.append(widget)
 
         def _start_load(path: str, preserve_state: bool = False):
@@ -356,6 +375,7 @@ class Tab2Widget(QWidget):
 
             if not preserve:
                 widget.c_u_axis = None
+                widget.c_world = None
                 for plane_widget in widget.plane_widgets:
                     plane_widget.current_mesh = mesh
                     plane_widget.points.clear()
@@ -380,6 +400,8 @@ class Tab2Widget(QWidget):
             self._render_posture1_plotter(widget, reset_view=True)
             widget.build_axis_btn.setEnabled(True)
             widget.clear_axis_btn.setEnabled(widget.c_u_axis is not None)
+            widget.build_world_btn.setEnabled(True)
+            widget.clear_world_btn.setEnabled(widget.c_world is not None)
             widget.log_view.append('完了')
             widget.load_btn.setEnabled(True)
             self._save_posture_cache(widget)
@@ -391,6 +413,8 @@ class Tab2Widget(QWidget):
         load_btn.clicked.connect(lambda: self._open_posture_file(widget))
         build_axis_btn.clicked.connect(lambda: self._build_c_u_axis(widget))
         clear_axis_btn.clicked.connect(lambda: self._clear_c_u_axis(widget))
+        build_world_btn.clicked.connect(lambda: self._build_c_world_axis(widget))
+        clear_world_btn.clicked.connect(lambda: self._clear_c_world_axis(widget))
 
         widget._start_load = _start_load
         widget._on_mesh_loaded = _on_mesh_loaded
@@ -643,22 +667,26 @@ class Tab2Widget(QWidget):
             '平面1（XY平面）': '#ff0000',
             '平面2（YZ平面）': '#0000ff',
             '平面3（ZX平面）': '#00ff00',
+            'W平面1': '#ff8c00',
+            'W平面2': '#00d4d4',
+            'W平面3': '#d040d0',
         }
-        for plane_label, points in posture_widget.shared_points.items():
-            if not points:
-                continue
-            points_array = np.array(points, dtype=float)
-            plotter.add_mesh(
-                pv.PolyData(points_array),
-                name=f'plane_points::{plane_label}',
-                color=plane_colors.get(plane_label, '#ff0000'),
-                point_size=12,
-                render_points_as_spheres=True,
-                style='points',
-                pickable=False,
-                reset_camera=False,
-                render=False,
-            )
+        for points_dict in (posture_widget.shared_points, getattr(posture_widget, 'shared_world_points', {})):
+            for plane_label, points in points_dict.items():
+                if not points:
+                    continue
+                points_array = np.array(points, dtype=float)
+                plotter.add_mesh(
+                    pv.PolyData(points_array),
+                    name=f'plane_points::{plane_label}',
+                    color=plane_colors.get(plane_label, '#ffffff'),
+                    point_size=12,
+                    render_points_as_spheres=True,
+                    style='points',
+                    pickable=False,
+                    reset_camera=False,
+                    render=False,
+                )
 
         active_index = getattr(posture_widget, 'active_plane_index', 0)
         active_plane = None
@@ -681,35 +709,39 @@ class Tab2Widget(QWidget):
                 )
 
         # Build surface planes from points (match Tab1 behavior)
-        plane_colors = {
+        surface_plane_colors = {
             '平面1（XY平面）': '#ff0000',
             '平面2（YZ平面）': '#0000ff',
             '平面3（ZX平面）': '#00ff00',
+            'W平面1': '#ff8c00',
+            'W平面2': '#00d4d4',
+            'W平面3': '#d040d0',
         }
-        for plane_label, points in posture_widget.shared_points.items():
-            if not points or len(points) < 3:
-                continue
-            try:
-                plane = self._build_plane_from_points(points)
-            except Exception:
-                plane = None
-            if plane is None:
-                continue
-            is_selected = (getattr(active_plane, 'plane_label', None) == plane_label)
-            try:
-                plotter.add_mesh(
-                    plane,
-                    name=f'plane_surface::{plane_label}',
-                    color=plane_colors.get(plane_label, '#ffffff'),
-                    opacity=0.45 if is_selected else 0.20,
-                    pickable=False,
-                    reset_camera=False,
-                    render=False,
-                    show_edges=False,
-                    smooth_shading=True,
-                )
-            except Exception:
-                pass
+        for points_dict in (posture_widget.shared_points, getattr(posture_widget, 'shared_world_points', {})):
+            for plane_label, points in points_dict.items():
+                if not points or len(points) < 3:
+                    continue
+                try:
+                    plane = self._build_plane_from_points(points)
+                except Exception:
+                    plane = None
+                if plane is None:
+                    continue
+                is_selected = (getattr(active_plane, 'plane_label', None) == plane_label)
+                try:
+                    plotter.add_mesh(
+                        plane,
+                        name=f'plane_surface::{plane_label}',
+                        color=surface_plane_colors.get(plane_label, '#ffffff'),
+                        opacity=0.45 if is_selected else 0.20,
+                        pickable=False,
+                        reset_camera=False,
+                        render=False,
+                        show_edges=False,
+                        smooth_shading=True,
+                    )
+                except Exception:
+                    pass
 
         self._draw_c_u_axis(posture_widget)
 
@@ -791,8 +823,43 @@ class Tab2Widget(QWidget):
             j_resolution=1,
         )
 
+    def _serialize_points_dict(self, points_dict):
+        return {
+            plane_label: [[float(p[0]), float(p[1]), float(p[2])] for p in pts]
+            for plane_label, pts in points_dict.items()
+        }
+
+    def _restore_points_dict(self, points_dict, cached):
+        for plane_label, plane_pts in points_dict.items():
+            plane_pts.clear()
+            for raw in (cached.get(plane_label) or []):
+                if isinstance(raw, (list, tuple)) and len(raw) == 3:
+                    try:
+                        plane_pts.append(np.array(raw, dtype=float))
+                    except Exception:
+                        continue
+
+    def _serialize_frame(self, frame):
+        if frame is None:
+            return None
+        return {
+            key: np.asarray(frame[key], dtype=float).tolist()
+            for key in ('origin', 'ex', 'ey', 'ez', 'raw_x', 'raw_y', 'raw_z')
+        }
+
+    def _deserialize_frame(self, raw):
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return {
+                key: np.array(raw[key], dtype=float)
+                for key in ('origin', 'ex', 'ey', 'ez', 'raw_x', 'raw_y', 'raw_z')
+            }
+        except Exception:
+            return None
+
     def _save_posture_cache(self, posture_widget):
-        """姿勢ごとの点群・C_u-axis・STL パスをユーザー設定に保存する。"""
+        """姿勢ごとの点群・C_u-axis・C_world・STL パスをユーザー設定に保存する。"""
         posture_key = getattr(posture_widget, 'posture_key', None)
         if not posture_key:
             return
@@ -808,28 +875,29 @@ class Tab2Widget(QWidget):
             else:
                 posture_entry.pop('stl_path', None)
 
-            points_serialized = {}
-            for plane_label, pts in posture_widget.shared_points.items():
-                points_serialized[plane_label] = [
-                    [float(p[0]), float(p[1]), float(p[2])] for p in pts
-                ]
-            posture_entry['points'] = points_serialized
+            posture_entry['points'] = self._serialize_points_dict(posture_widget.shared_points)
+            posture_entry['world_points'] = self._serialize_points_dict(
+                getattr(posture_widget, 'shared_world_points', {})
+            )
 
-            c_u_axis = getattr(posture_widget, 'c_u_axis', None)
-            if c_u_axis is not None:
-                posture_entry['c_u_axis'] = {
-                    key: np.asarray(c_u_axis[key], dtype=float).tolist()
-                    for key in ('origin', 'ex', 'ey', 'ez', 'raw_x', 'raw_y', 'raw_z')
-                }
+            c_u = self._serialize_frame(getattr(posture_widget, 'c_u_axis', None))
+            if c_u is not None:
+                posture_entry['c_u_axis'] = c_u
             else:
                 posture_entry.pop('c_u_axis', None)
+
+            c_world = self._serialize_frame(getattr(posture_widget, 'c_world', None))
+            if c_world is not None:
+                posture_entry['c_world'] = c_world
+            else:
+                posture_entry.pop('c_world', None)
 
             save_settings(settings)
         except Exception:
             pass
 
     def _load_posture_cache(self, posture_widget):
-        """設定から姿勢の状態を取り出す。点群と C_u-axis はその場で復元する。
+        """設定から姿勢の状態を取り出す。点群と座標系はその場で復元する。
 
         STL パス（あれば）は呼び出し側で `_start_load(path, preserve_state=True)` する。
         """
@@ -844,67 +912,44 @@ class Tab2Widget(QWidget):
         except Exception:
             return ''
 
-        cached_points = posture_entry.get('points') or {}
-        for plane_label, plane_pts in posture_widget.shared_points.items():
-            plane_pts.clear()
-            for raw in (cached_points.get(plane_label) or []):
-                if isinstance(raw, (list, tuple)) and len(raw) == 3:
-                    try:
-                        plane_pts.append(np.array(raw, dtype=float))
-                    except Exception:
-                        continue
+        self._restore_points_dict(posture_widget.shared_points, posture_entry.get('points') or {})
+        if hasattr(posture_widget, 'shared_world_points'):
+            self._restore_points_dict(
+                posture_widget.shared_world_points, posture_entry.get('world_points') or {}
+            )
 
-        cached_axis = posture_entry.get('c_u_axis')
-        if isinstance(cached_axis, dict):
-            try:
-                posture_widget.c_u_axis = {
-                    key: np.array(cached_axis[key], dtype=float)
-                    for key in ('origin', 'ex', 'ey', 'ez', 'raw_x', 'raw_y', 'raw_z')
-                }
-            except Exception:
-                posture_widget.c_u_axis = None
-        else:
-            posture_widget.c_u_axis = None
+        posture_widget.c_u_axis = self._deserialize_frame(posture_entry.get('c_u_axis'))
+        posture_widget.c_world = self._deserialize_frame(posture_entry.get('c_world'))
 
         return str(posture_entry.get('stl_path') or '')
 
-    def _build_c_u_axis(self, posture_widget):
-        """3 平面からローカル座標系 C_u-axis を構築する。
+    def _compute_axis_system(self, plane_points_in_order, log, prefix: str):
+        """3 平面の点群から、直交化済み座標系の dict を返す（共通ロジック）。
 
-        表示する 3 本のベクトルは「平面ペアの交線」:
-          X 軸 (赤) = 平面1 ∩ 平面3 の方向（= n_3 × n_1）
-          Y 軸 (青) = 平面1 ∩ 平面2 の方向（= n_1 × n_2）
-          Z 軸 (緑) = 平面2 ∩ 平面3 の方向（= n_2 × n_3）
-
-        計測誤差で 3 本は厳密には直交しないため、これらを最近接の直交行列へ
-        正規直交化したものを `ex/ey/ez` として保存（実際の座標系として利用）。
-        生の交線は `raw_x/raw_y/raw_z` に保持し、表示にはこちらを使う。
+        plane_points_in_order: 3 つの (N,3) numpy 配列のリスト（plane1, plane2, plane3 の順）
+        log: ログ表示用の QTextEdit
+        prefix: ログ／エラーメッセージ用のプレフィックス（例 'C_u-axis', 'C_world'）
+        戻り値: dict (origin, ex, ey, ez, raw_x, raw_y, raw_z) または None
         """
-        log = posture_widget.log_view
-        plane_keys = ['平面1（XY平面）', '平面2（YZ平面）', '平面3（ZX平面）']
-
-        pts_lists = []
-        for i, key in enumerate(plane_keys, 1):
-            pts = list(posture_widget.shared_points.get(key, []))
-            if len(pts) < 3:
-                log.append(f'C_u-axis: 平面{i}には3点以上が必要です（現在 {len(pts)} 点）。')
-                return
-            pts_lists.append(np.array(pts, dtype=float))
+        for i, arr in enumerate(plane_points_in_order, 1):
+            if arr.shape[0] < 3:
+                log.append(f'{prefix}: 平面{i}には3点以上が必要です（現在 {arr.shape[0]} 点）。')
+                return None
 
         centroids = []
         normals = []
-        for i, arr in enumerate(pts_lists, 1):
+        for i, arr in enumerate(plane_points_in_order, 1):
             fit = self._fit_plane_basis(arr)
             if fit is None:
-                log.append(f'C_u-axis: 平面{i}のフィッティングに失敗しました。')
-                return
+                log.append(f'{prefix}: 平面{i}のフィッティングに失敗しました。')
+                return None
             c, n, _u, _v = fit
             centroids.append(c)
             normals.append(np.array(n, dtype=float))
 
         # 法線の符号正規化：各 n_i を「他 2 平面の点群の重心」へ向ける
         for i in range(3):
-            others = np.vstack([pts_lists[j] for j in range(3) if j != i])
+            others = np.vstack([plane_points_in_order[j] for j in range(3) if j != i])
             ref_dir = others.mean(axis=0) - centroids[i]
             if np.dot(normals[i], ref_dir) < 0:
                 normals[i] = -normals[i]
@@ -918,25 +963,23 @@ class Tab2Widget(QWidget):
         try:
             origin = np.linalg.solve(A, d)
         except np.linalg.LinAlgError:
-            log.append('C_u-axis: 3 平面の交点が一意に決まりません（平面が平行または一次従属です）。')
-            return
+            log.append(f'{prefix}: 3 平面の交点が一意に決まりません（平面が平行または一次従属です）。')
+            return None
 
         def _safe_normalize(v, name):
-            n = np.linalg.norm(v)
-            if n < 1e-9:
-                log.append(f'C_u-axis: {name} を構築できません（平面の法線が平行）。')
+            nn = np.linalg.norm(v)
+            if nn < 1e-9:
+                log.append(f'{prefix}: {name} を構築できません（平面の法線が平行）。')
                 return None
-            return v / n
+            return v / nn
 
-        # 平面ペアの交線（ユーザー指定の対応関係 + 理想直交時に正の向きになる符号順）
         raw_x = _safe_normalize(np.cross(n3, n1), 'X 軸')   # 平面1 ∩ 平面3
         raw_y = _safe_normalize(np.cross(n1, n2), 'Y 軸')   # 平面1 ∩ 平面2
         raw_z = _safe_normalize(np.cross(n2, n3), 'Z 軸')   # 平面2 ∩ 平面3
         if raw_x is None or raw_y is None or raw_z is None:
-            return
+            return None
 
-        # 最近接の正規直交行列（極分解 / Procrustes）。3 本の交線が厳密に直交
-        # しない場合でも、ノルム保存最小ずれの直交フレームを得る。
+        # 最近接の正規直交行列（極分解 / Procrustes）
         M = np.column_stack([raw_x, raw_y, raw_z])
         U, _, Vt = np.linalg.svd(M)
         R = U @ Vt
@@ -947,7 +990,7 @@ class Tab2Widget(QWidget):
         e_y = R[:, 1]
         e_z = R[:, 2]
 
-        # ユーザー要求: X 軸と Z 軸を反転（Y はそのまま、右手系は保たれる）
+        # X 軸と Z 軸を反転（Y はそのまま、右手系保存）
         e_x = -e_x
         e_z = -e_z
         raw_x = -raw_x
@@ -956,13 +999,7 @@ class Tab2Widget(QWidget):
         def _deg(v, w):
             return float(np.degrees(np.arccos(np.clip(float(np.dot(v, w)), -1.0, 1.0))))
 
-        posture_widget.c_u_axis = {
-            'origin': origin,
-            'ex': e_x, 'ey': e_y, 'ez': e_z,
-            'raw_x': raw_x, 'raw_y': raw_y, 'raw_z': raw_z,
-        }
-
-        log.append('C_u-axis 座標系を構築しました:')
+        log.append(f'{prefix} 座標系を構築しました:')
         log.append(f'  原点 O = ({origin[0]:.3f}, {origin[1]:.3f}, {origin[2]:.3f})')
         log.append('  [直交化前: 生の平面交線]')
         log.append(f'    X_raw(平面1∩平面3) = ({raw_x[0]:+.4f}, {raw_x[1]:+.4f}, {raw_x[2]:+.4f})')
@@ -974,7 +1011,7 @@ class Tab2Widget(QWidget):
             f'∠(Y_raw, Z_raw) = {_deg(raw_y, raw_z):.4f}°, '
             f'∠(Z_raw, X_raw) = {_deg(raw_z, raw_x):.4f}°'
         )
-        log.append('  [直交化後: C_u-axis 基底（表示ベクトル）]')
+        log.append(f'  [直交化後: {prefix} 基底（表示ベクトル）]')
         log.append(f'    X(赤) e_x = ({e_x[0]:+.4f}, {e_x[1]:+.4f}, {e_x[2]:+.4f})')
         log.append(f'    Y(青) e_y = ({e_y[0]:+.4f}, {e_y[1]:+.4f}, {e_y[2]:+.4f})')
         log.append(f'    Z(緑) e_z = ({e_z[0]:+.4f}, {e_z[1]:+.4f}, {e_z[2]:+.4f})')
@@ -985,7 +1022,38 @@ class Tab2Widget(QWidget):
             f'∠(e_z, e_x) = {_deg(e_z, e_x):.4f}°'
         )
 
+        return {
+            'origin': origin,
+            'ex': e_x, 'ey': e_y, 'ez': e_z,
+            'raw_x': raw_x, 'raw_y': raw_y, 'raw_z': raw_z,
+        }
+
+    def _collect_plane_points(self, points_dict, plane_keys):
+        """点群 dict から指定キー順に numpy 配列リストを取り出す。"""
+        return [
+            np.array(list(points_dict.get(k, [])), dtype=float) if points_dict.get(k) else np.zeros((0, 3))
+            for k in plane_keys
+        ]
+
+    def _build_c_u_axis(self, posture_widget):
+        plane_keys = ['平面1（XY平面）', '平面2（YZ平面）', '平面3（ZX平面）']
+        pts = self._collect_plane_points(posture_widget.shared_points, plane_keys)
+        result = self._compute_axis_system(pts, posture_widget.log_view, prefix='C_u-axis')
+        if result is None:
+            return
+        posture_widget.c_u_axis = result
         posture_widget.clear_axis_btn.setEnabled(True)
+        self._render_posture1_plotter(posture_widget, reset_view=False)
+        self._save_posture_cache(posture_widget)
+
+    def _build_c_world_axis(self, posture_widget):
+        plane_keys = ['W平面1', 'W平面2', 'W平面3']
+        pts = self._collect_plane_points(posture_widget.shared_world_points, plane_keys)
+        result = self._compute_axis_system(pts, posture_widget.log_view, prefix='C_world')
+        if result is None:
+            return
+        posture_widget.c_world = result
+        posture_widget.clear_world_btn.setEnabled(True)
         self._render_posture1_plotter(posture_widget, reset_view=False)
         self._save_posture_cache(posture_widget)
 
@@ -998,22 +1066,22 @@ class Tab2Widget(QWidget):
         self._render_posture1_plotter(posture_widget, reset_view=False)
         self._save_posture_cache(posture_widget)
 
+    def _clear_c_world_axis(self, posture_widget):
+        if getattr(posture_widget, 'c_world', None) is None:
+            return
+        posture_widget.c_world = None
+        posture_widget.clear_world_btn.setEnabled(False)
+        posture_widget.log_view.append('C_world 座標系を消去しました。')
+        self._render_posture1_plotter(posture_widget, reset_view=False)
+        self._save_posture_cache(posture_widget)
+
     def _draw_c_u_axis(self, posture_widget):
+        """姿勢上の 2 つの座標系（C_u-axis_posi_i と C_world）を 3D ビューに描画。"""
         plotter = getattr(posture_widget, 'plotter', None)
-        c_u_axis = getattr(posture_widget, 'c_u_axis', None)
         if plotter is None or not HAS_PYVISTA:
             return
 
-        # 既存アクターを除去（軸が消えた場合もクリアされる）
-        for name in ('c_u_axis_x', 'c_u_axis_y', 'c_u_axis_z', 'c_u_axis_origin', 'c_u_axis_label'):
-            try:
-                plotter.remove_actor(name)
-            except Exception:
-                pass
-
-        if c_u_axis is None:
-            return
-
+        # スケール基準
         mesh = posture_widget.current_mesh
         if mesh is not None:
             b = mesh.bounds
@@ -1022,30 +1090,76 @@ class Tab2Widget(QWidget):
             diag = 100.0
         axis_len = max(diag * 0.2, 1.0)
 
-        origin = c_u_axis['origin']
-        # 表示する 3 本のベクトルは SVD で正規直交化した C_u-axis 基底:
-        #   X 軸 (赤) = e_x
-        #   Y 軸 (青) = e_y
-        #   Z 軸 (緑) = e_z
-        # （これらは厳密に互いに直交し、ロボットアームのローカル座標系として使う）
-        for name, vec, color in (
-            ('c_u_axis_x', c_u_axis['ex'], '#ff3030'),
-            ('c_u_axis_y', c_u_axis['ey'], '#3060ff'),
-            ('c_u_axis_z', c_u_axis['ez'], '#30c030'),
-        ):
+        systems = [
+            {
+                'key': 'c_u_axis',
+                'frame': getattr(posture_widget, 'c_u_axis', None),
+                'label': getattr(posture_widget, 'c_u_axis_name', 'C_u-axis'),
+                'label_color': '#ffffaa',
+                'origin_color': '#ffff66',
+                'arrow_colors': ('#ff3030', '#3060ff', '#30c030'),  # X red / Y blue / Z green
+                'actor_prefix': 'c_u_axis',
+            },
+            {
+                'key': 'c_world',
+                'frame': getattr(posture_widget, 'c_world', None),
+                'label': 'C_world',
+                'label_color': '#bfe4ff',
+                'origin_color': '#80c0ff',
+                # 同色だと混乱するが、ユーザー指定の規約（X=赤 / Y=青 / Z=緑）に揃える
+                'arrow_colors': ('#ff3030', '#3060ff', '#30c030'),
+                'actor_prefix': 'c_world',
+            },
+        ]
+
+        for sys_def in systems:
+            prefix = sys_def['actor_prefix']
+            # 既存アクター除去
+            for suffix in ('_x', '_y', '_z', '_origin', '_label'):
+                try:
+                    plotter.remove_actor(prefix + suffix)
+                except Exception:
+                    pass
+
+            frame = sys_def['frame']
+            if frame is None:
+                continue
+
+            origin = frame['origin']
+            cx, cy, cz = sys_def['arrow_colors']
+            for suffix, vec, color in (
+                ('_x', frame['ex'], cx),
+                ('_y', frame['ey'], cy),
+                ('_z', frame['ez'], cz),
+            ):
+                try:
+                    arrow = pv.Arrow(
+                        start=origin,
+                        direction=vec,
+                        scale=axis_len,
+                        shaft_radius=0.015,
+                        tip_radius=0.045,
+                        tip_length=0.20,
+                    )
+                    plotter.add_mesh(
+                        arrow,
+                        name=prefix + suffix,
+                        color=color,
+                        pickable=False,
+                        reset_camera=False,
+                        render=False,
+                    )
+                except Exception:
+                    pass
+
             try:
-                arrow = pv.Arrow(
-                    start=origin,
-                    direction=vec,
-                    scale=axis_len,
-                    shaft_radius=0.015,
-                    tip_radius=0.045,
-                    tip_length=0.20,
-                )
                 plotter.add_mesh(
-                    arrow,
-                    name=name,
-                    color=color,
+                    pv.PolyData(np.array([origin], dtype=float)),
+                    name=prefix + '_origin',
+                    color=sys_def['origin_color'],
+                    point_size=14,
+                    render_points_as_spheres=True,
+                    style='points',
                     pickable=False,
                     reset_camera=False,
                     render=False,
@@ -1053,42 +1167,27 @@ class Tab2Widget(QWidget):
             except Exception:
                 pass
 
-        try:
-            plotter.add_mesh(
-                pv.PolyData(np.array([origin], dtype=float)),
-                name='c_u_axis_origin',
-                color='#ffff66',
-                point_size=14,
-                render_points_as_spheres=True,
-                style='points',
-                pickable=False,
-                reset_camera=False,
-                render=False,
+            # 座標系名のラベル（原点から軸長 10% オフセット）
+            label_offset = axis_len * 0.10
+            label_pos = np.array(origin, dtype=float) + np.array(
+                [label_offset, label_offset, label_offset], dtype=float
             )
-        except Exception:
-            pass
-
-        # 座標系のラベル（例: 'C_u-axis_posi1'）を原点付近に 3D ラベルとして配置
-        label_text = getattr(posture_widget, 'c_u_axis_name', 'C_u-axis')
-        # 少し原点からオフセット（軸長の 10%）して可読性を上げる
-        label_offset = axis_len * 0.10
-        label_pos = np.array(origin, dtype=float) + np.array([label_offset, label_offset, label_offset], dtype=float)
-        try:
-            plotter.add_point_labels(
-                np.array([label_pos], dtype=float),
-                [label_text],
-                name='c_u_axis_label',
-                font_size=14,
-                text_color='#ffffaa',
-                point_size=0,
-                shape=None,
-                always_visible=True,
-                pickable=False,
-                reset_camera=False,
-                render=False,
-            )
-        except Exception:
-            pass
+            try:
+                plotter.add_point_labels(
+                    np.array([label_pos], dtype=float),
+                    [sys_def['label']],
+                    name=prefix + '_label',
+                    font_size=14,
+                    text_color=sys_def['label_color'],
+                    point_size=0,
+                    shape=None,
+                    always_visible=True,
+                    pickable=False,
+                    reset_camera=False,
+                    render=False,
+                )
+            except Exception:
+                pass
 
     def _open_posture_file(self, widget):
         path, _ = QFileDialog.getOpenFileName(widget, 'STLファイルを開く', '', 'STL Files (*.stl)')
