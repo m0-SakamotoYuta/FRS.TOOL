@@ -16,22 +16,59 @@ class Splash(QWidget):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(400, 200)
+        # 角丸の不透明な背景にして、緑のプログレスバーが映えるようにする
+        self.setFixedSize(440, 240)
+        self.setStyleSheet(
+            'QWidget#splashRoot { background-color: #1f242c; border: 1px solid #3a4150; border-radius: 8px; } '
+            'QLabel { color: #eaeaea; font-size: 13px; } '
+            'QTextEdit { background-color: #14171c; color: #d6d6d6; border: 1px solid #2a2f38; border-radius: 4px; }'
+        )
+        self.setObjectName('splashRoot')
+
         layout = QVBoxLayout()
         layout.setContentsMargins(20, 20, 20, 20)
-        self.label = QLabel('FRS Simulator\n読み込み中...')
+
+        self.label = QLabel('FRS Tools\n読み込み中...')
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.label)
-        # simple log area
+
+        # 緑色のプログレスバー（既定はアニメーション動作の不定モード）
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(18)
+        self.progress.setStyleSheet(
+            'QProgressBar { '
+            '    background-color: #14171c; '
+            '    border: 1px solid #2a2f38; '
+            '    border-radius: 4px; '
+            '} '
+            'QProgressBar::chunk { '
+            '    background-color: #4caf50; '
+            '    border-radius: 3px; '
+            '}'
+        )
+        layout.addWidget(self.progress)
+
+        # ログ表示エリア
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setFixedHeight(70)
+        self.log.setFixedHeight(80)
         layout.addWidget(self.log)
         self.setLayout(layout)
 
     def append_log(self, text: str):
         self.log.append(text)
+
+    def set_progress(self, value: int):
+        """0–100 の決定モードへ切替。0 未満は不定（マーキー）モード。"""
+        if value is None or value < 0:
+            self.progress.setRange(0, 0)
+        else:
+            v = max(0, min(100, int(value)))
+            self.progress.setRange(0, 100)
+            self.progress.setValue(v)
+            self.progress.setTextVisible(True)
 
 
 class LoadingDialog(QDialog):

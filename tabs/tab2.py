@@ -110,13 +110,22 @@ class Tab2Widget(QWidget):
         # 軸ごとに独立した posture_widgets を保持: {'u': {...}, 'v': {...}, 'w': {...}}
         self.axis_data = {}
         self.visual_widgets = []
+        # C_world 座標系での共有カメラ姿勢（タブ間で引き継ぐ）
+        self.shared_camera_world = None
+        # 手動で「記録」した視点（C_world 座標系）
+        self.recorded_view_world = None
+        self.all_view_widget = None
+        self._load_shared_camera_cache()
+        self._load_recorded_view_cache()
+
         layout = QVBoxLayout(self)
 
-        subtabs = QTabWidget()
+        self.top_subtabs = QTabWidget()
         axis_names = ['ALL VIEW', 'U axis', 'V axis', 'W axis', 'X axis', 'Y axis', 'Z axis']
         for axis_name in axis_names:
             if axis_name == 'ALL VIEW':
                 axis_widget = self._create_all_view_tab()
+                self.all_view_widget = axis_widget
             elif axis_name in ('U axis', 'V axis', 'W axis'):
                 letter = axis_name[0].lower()  # 'u' / 'v' / 'w'
                 axis_widget = self._create_axis_tab(letter, joint_type='rotation')
@@ -125,9 +134,12 @@ class Tab2Widget(QWidget):
                 axis_widget = self._create_axis_tab(letter, joint_type='translation')
             else:
                 axis_widget = self._create_simple_axis_tab(axis_name)
-            subtabs.addTab(axis_widget, axis_name)
+            self.top_subtabs.addTab(axis_widget, axis_name)
 
-        layout.addWidget(subtabs)
+        # トップ階層タブの切替で、現在表示中のプロッタへ共有カメラを反映
+        self.top_subtabs.currentChanged.connect(self._on_top_subtab_changed)
+
+        layout.addWidget(self.top_subtabs)
         self.setLayout(layout)
 
     def _load_visual_settings(self):
@@ -271,6 +283,16 @@ class Tab2Widget(QWidget):
         import_parallel_btn.setEnabled(False)
         left_layout.addWidget(import_parallel_btn)
 
+        # === 視点記録ボタン ===
+        view_btn_row = QHBoxLayout()
+        record_view_btn = QPushButton('視点を記録')
+        restore_view_btn = QPushButton('記録視点に戻す')
+        view_btn_row.addWidget(record_view_btn)
+        view_btn_row.addWidget(restore_view_btn)
+        left_layout.addLayout(view_btn_row)
+        record_view_btn.clicked.connect(lambda: self._record_view(widget))
+        restore_view_btn.clicked.connect(lambda: self._restore_recorded_view(widget))
+
         # === 軸の表示切替 ===
         visibility_group = QGroupBox('軸の表示')
         vis_layout = QVBoxLayout(visibility_group)
@@ -369,6 +391,8 @@ class Tab2Widget(QWidget):
             right_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         widget.plotter = plotter
+        widget.display_in_world_frame = False  # base STL は自前の座標系で表示
+        self._attach_camera_observer(widget)
 
         # === 下段: ログ ===
         log_view = QTextEdit()
@@ -601,6 +625,8 @@ class Tab2Widget(QWidget):
         widget.import_rotation_btn.setEnabled(True)
         widget.import_parallel_btn.setEnabled(True)
         self._render_all_view(widget, reset_view=False)
+        # C_world ができたので共有カメラを反映
+        self._apply_shared_camera_with_render(widget)
         self._save_posture_cache(widget)
 
     def _clear_c_world_for_all_view(self, widget):
@@ -632,6 +658,409 @@ class Tab2Widget(QWidget):
             widget.axis_visibility = {}
         widget.axis_visibility[axis_name] = bool(checked)
         self._render_all_view(widget, reset_view=False)
+
+    # ----- 視点共有（C_world 基準） -----
+    # 各タブで manual に動かしたカメラを C_world 座標系で保存し、別タブにも引き継ぐ。
+    # キャッシュは settings.json の tab2.shared_camera_world に保存。
+
+    def _load_shared_camera_cache(self):
+        try:
+            settings = load_settings() or {}
+            sc = (settings.get('tab2') or {}).get('shared_camera_world')
+            if isinstance(sc, dict) and all(k in sc for k in ('position', 'focal', 'view_up')):
+                self.shared_camera_world = {
+                    'position': [float(v) for v in sc['position']],
+                    'focal': [float(v) for v in sc['focal']],
+                    'view_up': [float(v) for v in sc['view_up']],
+                }
+        except Exception:
+            pass
+
+    def _save_shared_camera_cache(self):
+        if self.shared_camera_world is None:
+            return
+        try:
+            settings = load_settings() or {}
+            tab2 = settings.setdefault('tab2', {})
+            tab2['shared_camera_world'] = {
+                'position': [float(v) for v in self.shared_camera_world['position']],
+                'focal': [float(v) for v in self.shared_camera_world['focal']],
+                'view_up': [float(v) for v in self.shared_camera_world['view_up']],
+            }
+            save_settings(settings)
+        except Exception:
+            pass
+
+    def _load_recorded_view_cache(self):
+        try:
+            settings = load_settings() or {}
+            rv = (settings.get('tab2') or {}).get('recorded_view_world')
+            if isinstance(rv, dict) and all(k in rv for k in ('position', 'focal', 'view_up')):
+                self.recorded_view_world = {
+                    'position': [float(v) for v in rv['position']],
+                    'focal': [float(v) for v in rv['focal']],
+                    'view_up': [float(v) for v in rv['view_up']],
+                }
+        except Exception:
+            pass
+
+    def _save_recorded_view_cache(self):
+        try:
+            settings = load_settings() or {}
+            tab2 = settings.setdefault('tab2', {})
+            if self.recorded_view_world is None:
+                tab2.pop('recorded_view_world', None)
+            else:
+                tab2['recorded_view_world'] = {
+                    'position': [float(v) for v in self.recorded_view_world['position']],
+                    'focal': [float(v) for v in self.recorded_view_world['focal']],
+                    'view_up': [float(v) for v in self.recorded_view_world['view_up']],
+                }
+            save_settings(settings)
+        except Exception:
+            pass
+
+    # ----- motion-axis (回転軸/並進軸) のキャッシュ -----
+    def _capture_motion_source_state(self, posture_widgets):
+        """motion-axis のソースとなる c_axis/c_world のスナップショット。"""
+        state = []
+        for p in ('姿勢1', '姿勢2', '姿勢3'):
+            pw = posture_widgets.get(p) if posture_widgets else None
+            ca = getattr(pw, 'c_axis', None) if pw else None
+            cw = getattr(pw, 'c_world', None) if pw else None
+            state.append({
+                'c_axis': self._serialize_frame(ca),
+                'c_world': self._serialize_frame(cw),
+            })
+        return state
+
+    def _serialize_motion_axis(self, mot):
+        if mot is None:
+            return None
+        try:
+            return {
+                'direction': [float(v) for v in mot['direction']],
+                'point': [float(v) for v in mot['point']],
+                'R_local_world': [np.asarray(m, dtype=float).tolist() for m in mot['R_local_world']],
+                'O_local_world': [np.asarray(o, dtype=float).tolist() for o in mot['O_local_world']],
+                'T_stl_to_world': [np.asarray(t, dtype=float).tolist() for t in mot['T_stl_to_world']],
+            }
+        except Exception:
+            return None
+
+    def _deserialize_motion_axis(self, d):
+        if not isinstance(d, dict):
+            return None
+        try:
+            return {
+                'direction': np.array(d['direction'], dtype=float),
+                'point': np.array(d['point'], dtype=float),
+                'R_local_world': [np.array(m, dtype=float) for m in d['R_local_world']],
+                'O_local_world': [np.array(o, dtype=float) for o in d['O_local_world']],
+                'T_stl_to_world': [np.array(t, dtype=float) for t in d['T_stl_to_world']],
+            }
+        except Exception:
+            return None
+
+    def _save_motion_axis_cache(self, motion_widget):
+        axis_letter = getattr(motion_widget, 'axis_letter', None)
+        if not axis_letter:
+            return
+        try:
+            settings = load_settings() or {}
+            tab2 = settings.setdefault('tab2', {})
+            key = f'{axis_letter}_motion'
+            mot = getattr(motion_widget, 'motion_axis', None)
+            if mot is None:
+                tab2.pop(key, None)
+            else:
+                tab2[key] = {
+                    'motion_axis': self._serialize_motion_axis(mot),
+                    'source_state': self._capture_motion_source_state(motion_widget.posture_widgets),
+                    'log_text': motion_widget.log_view.toPlainText(),
+                    'joint_type': getattr(motion_widget, 'joint_type', 'rotation'),
+                }
+            save_settings(settings)
+        except Exception:
+            pass
+
+    def _load_motion_axis_cache(self, motion_widget):
+        axis_letter = getattr(motion_widget, 'axis_letter', None)
+        if not axis_letter:
+            return
+        try:
+            settings = load_settings() or {}
+            entry = (settings.get('tab2') or {}).get(f'{axis_letter}_motion') or {}
+        except Exception:
+            entry = {}
+        if not entry:
+            motion_widget.motion_axis = None
+            motion_widget.needs_update = False
+            return
+        mot = self._deserialize_motion_axis(entry.get('motion_axis'))
+        motion_widget.motion_axis = mot
+        log_text = entry.get('log_text') or ''
+        if log_text:
+            try:
+                motion_widget.log_view.setPlainText(log_text)
+            except Exception:
+                pass
+        # 現在のソース状態と比較し needs_update を判定
+        try:
+            cached_state = entry.get('source_state') or []
+            current_state = self._capture_motion_source_state(motion_widget.posture_widgets)
+            motion_widget.needs_update = (cached_state != current_state)
+        except Exception:
+            motion_widget.needs_update = True
+
+    def _invalidate_motion_for_posture(self, posture_widget):
+        """指定の posture 側で c_axis または c_world が変わった場合に呼ぶ。
+        対応する motion_widget を needs_update にし、再描画。"""
+        axis_letter = getattr(posture_widget, 'axis_letter', None)
+        if not axis_letter or axis_letter not in self.axis_data:
+            return
+        mw = self.axis_data[axis_letter].get('motion_widget')
+        if mw is None:
+            return
+        mw.needs_update = True
+        try:
+            self._save_motion_axis_cache(mw)
+        except Exception:
+            pass
+        try:
+            self._render_motion_view(mw)
+        except Exception:
+            pass
+
+    def _maybe_render_motion_after_mesh_load(self, posture_widget):
+        """姿勢 STL がロード完了したタイミングで、3 姿勢が揃っていれば motion-axis を再描画。"""
+        axis_letter = getattr(posture_widget, 'axis_letter', None)
+        if not axis_letter or axis_letter not in self.axis_data:
+            return
+        mw = self.axis_data[axis_letter].get('motion_widget')
+        if mw is None:
+            return
+        all_loaded = all(
+            getattr(pw, 'current_mesh', None) is not None
+            for pw in mw.posture_widgets.values()
+        )
+        if not all_loaded:
+            return
+        try:
+            self._render_motion_view(mw)
+        except Exception:
+            pass
+
+    def _record_view(self, widget):
+        """現在のカメラを C_world 座標系で記録（手動スナップショット）。"""
+        plotter = getattr(widget, 'plotter', None)
+        log = getattr(widget, 'log_view', None)
+        if plotter is None or not HAS_PYVISTA:
+            return
+        in_world = getattr(widget, 'display_in_world_frame', False)
+        c_world = None if in_world else getattr(widget, 'c_world', None)
+        if not in_world and c_world is None:
+            if log is not None:
+                log.append('視点を記録できません（C_world が未生成のため、座標変換できません）。')
+            return
+        try:
+            cam = plotter.camera
+            pos = list(cam.position)
+            focal = list(cam.focal_point)
+            up = list(cam.up)
+        except Exception:
+            return
+        try:
+            w_pos, w_focal, w_up = self._display_to_world_cam(pos, focal, up, c_world)
+        except Exception:
+            return
+        self.recorded_view_world = {
+            'position': w_pos,
+            'focal': w_focal,
+            'view_up': w_up,
+        }
+        self._save_recorded_view_cache()
+        if log is not None:
+            log.append(
+                f'視点を記録しました（C_world 座標系）: '
+                f'pos=({w_pos[0]:+.3f}, {w_pos[1]:+.3f}, {w_pos[2]:+.3f}), '
+                f'up=({w_up[0]:+.3f}, {w_up[1]:+.3f}, {w_up[2]:+.3f})'
+            )
+
+    def _restore_recorded_view(self, widget):
+        """記録された視点に戻し、共有カメラも同値で上書きしてタブ間に伝搬。"""
+        plotter = getattr(widget, 'plotter', None)
+        log = getattr(widget, 'log_view', None)
+        if plotter is None or not HAS_PYVISTA:
+            return
+        if self.recorded_view_world is None:
+            if log is not None:
+                log.append('記録された視点がありません。先に「視点を記録」してください。')
+            return
+        in_world = getattr(widget, 'display_in_world_frame', False)
+        c_world = None if in_world else getattr(widget, 'c_world', None)
+        if not in_world and c_world is None:
+            if log is not None:
+                log.append('視点を復元できません（C_world が未生成のため、座標変換できません）。')
+            return
+        try:
+            rv = self.recorded_view_world
+            d_pos, d_focal, d_up = self._world_to_display_cam(
+                rv['position'], rv['focal'], rv['view_up'], c_world,
+            )
+            plotter.camera_position = [tuple(d_pos), tuple(d_focal), tuple(d_up)]
+            try:
+                plotter.reset_camera_clipping_range()
+            except Exception:
+                pass
+            plotter.render()
+            # 復元した視点を共有カメラへ反映 → 他タブにも引き継がれる
+            self.shared_camera_world = dict(self.recorded_view_world)
+            self._save_shared_camera_cache()
+            if log is not None:
+                log.append('記録された視点に戻しました。')
+        except Exception:
+            pass
+
+    def _display_to_world_cam(self, position, focal, view_up, c_world):
+        pos = np.asarray(position, dtype=float)
+        foc = np.asarray(focal, dtype=float)
+        up = np.asarray(view_up, dtype=float)
+        if c_world is None:
+            return pos.tolist(), foc.tolist(), up.tolist()
+        R_w = np.column_stack([c_world['ex'], c_world['ey'], c_world['ez']])
+        O_w = np.asarray(c_world['origin'], dtype=float)
+        R_w_T = R_w.T
+        return (
+            (R_w_T @ (pos - O_w)).tolist(),
+            (R_w_T @ (foc - O_w)).tolist(),
+            (R_w_T @ up).tolist(),
+        )
+
+    def _world_to_display_cam(self, position, focal, view_up, c_world):
+        pos = np.asarray(position, dtype=float)
+        foc = np.asarray(focal, dtype=float)
+        up = np.asarray(view_up, dtype=float)
+        if c_world is None:
+            return pos.tolist(), foc.tolist(), up.tolist()
+        R_w = np.column_stack([c_world['ex'], c_world['ey'], c_world['ez']])
+        O_w = np.asarray(c_world['origin'], dtype=float)
+        return (
+            (O_w + R_w @ pos).tolist(),
+            (O_w + R_w @ foc).tolist(),
+            (R_w @ up).tolist(),
+        )
+
+    def _on_camera_interaction_end(self, widget):
+        plotter = getattr(widget, 'plotter', None)
+        if plotter is None or not HAS_PYVISTA:
+            return
+        in_world = getattr(widget, 'display_in_world_frame', False)
+        c_world = None if in_world else getattr(widget, 'c_world', None)
+        if not in_world and c_world is None:
+            return  # 変換に C_world が要るが未生成
+        try:
+            cam = plotter.camera
+            pos = list(cam.position)
+            focal = list(cam.focal_point)
+            up = list(cam.up)
+        except Exception:
+            return
+        try:
+            w_pos, w_focal, w_up = self._display_to_world_cam(pos, focal, up, c_world)
+        except Exception:
+            return
+        self.shared_camera_world = {
+            'position': w_pos,
+            'focal': w_focal,
+            'view_up': w_up,
+        }
+        self._save_shared_camera_cache()
+
+    def _set_camera_from_shared(self, widget):
+        """shared_camera_world をこのウィジェットの表示座標へ変換して適用。
+        render() は呼ばない。成功すれば True。"""
+        if self.shared_camera_world is None:
+            return False
+        plotter = getattr(widget, 'plotter', None)
+        if plotter is None or not HAS_PYVISTA:
+            return False
+        in_world = getattr(widget, 'display_in_world_frame', False)
+        c_world = None if in_world else getattr(widget, 'c_world', None)
+        if not in_world and c_world is None:
+            return False
+        try:
+            sc = self.shared_camera_world
+            d_pos, d_focal, d_up = self._world_to_display_cam(
+                sc['position'], sc['focal'], sc['view_up'], c_world,
+            )
+            plotter.camera_position = [tuple(d_pos), tuple(d_focal), tuple(d_up)]
+            try:
+                plotter.reset_camera_clipping_range()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def _apply_shared_camera_with_render(self, widget):
+        if self._set_camera_from_shared(widget):
+            try:
+                widget.plotter.render()
+            except Exception:
+                pass
+
+    def _active_widget_in_axis(self, axis_letter):
+        ad = self.axis_data.get(axis_letter)
+        if not ad:
+            return None
+        subtabs = ad['subtabs']
+        idx = subtabs.currentIndex()
+        # 0/1/2 = posture1/2/3, 3 = motion-axis
+        if 0 <= idx <= 2:
+            pw_list = list(ad['posture_widgets'].values())
+            if idx < len(pw_list):
+                return pw_list[idx]
+        return ad.get('motion_widget')
+
+    def _on_axis_subtab_changed(self, axis_letter):
+        widget = self._active_widget_in_axis(axis_letter)
+        if widget is not None:
+            self._apply_shared_camera_with_render(widget)
+
+    def _on_top_subtab_changed(self, index):
+        try:
+            tab_name = self.top_subtabs.tabText(index)
+        except Exception:
+            return
+        if tab_name == 'ALL VIEW':
+            if self.all_view_widget is not None:
+                self._apply_shared_camera_with_render(self.all_view_widget)
+        elif tab_name in ('U axis', 'V axis', 'W axis', 'X axis', 'Y axis', 'Z axis'):
+            letter = tab_name[0].lower()
+            widget = self._active_widget_in_axis(letter)
+            if widget is not None:
+                self._apply_shared_camera_with_render(widget)
+
+    def _attach_camera_observer(self, widget):
+        plotter = getattr(widget, 'plotter', None)
+        if plotter is None or not HAS_PYVISTA:
+            return
+        cb = lambda *_a, w=widget: self._on_camera_interaction_end(w)
+        try:
+            plotter.iren.add_observer('EndInteractionEvent', cb)
+            return
+        except Exception:
+            pass
+        try:
+            plotter.iren.AddObserver('EndInteractionEvent', cb)
+            return
+        except Exception:
+            pass
+        try:
+            plotter.interactor.AddObserver('EndInteractionEvent', cb)
+        except Exception:
+            pass
 
     def _on_axis_arrow_visibility_toggled(self, widget, axis_name, checked):
         if not hasattr(widget, 'axis_arrow_visibility'):
@@ -1060,7 +1489,9 @@ class Tab2Widget(QWidget):
                     pass
 
         if reset_view:
-            plotter.reset_camera(bounds=widget.current_mesh.bounds)
+            bounds = widget.current_mesh.bounds
+            if not self._set_camera_from_shared(widget):
+                plotter.reset_camera(bounds=bounds)
         elif camera_position is not None:
             try:
                 plotter.camera_position = camera_position
@@ -1110,12 +1541,10 @@ class Tab2Widget(QWidget):
             posture_widgets[posture_label] = posture_widget
             posture_subtabs.addTab(posture_widget, posture_label)
 
-        # 姿勢3 の次に「X軸回転軸 / 並進軸」タブを追加
-        # 姿勢ごとの表示切替コントロールは今は U axis のみ有効化（要望どおり段階的に導入）
-        enable_posture_ctrls = (axis_letter == 'u')
+        # 姿勢3 の次に「X軸回転軸 / 並進軸」タブを追加（姿勢表示切替は全軸で有効化）
         motion_widget = self._create_motion_axis_tab(
             axis_letter, posture_widgets, joint_type=joint_type,
-            enable_posture_controls=enable_posture_ctrls,
+            enable_posture_controls=True,
         )
         tab_label = f'{axis_letter.upper()}軸回転軸' if joint_type == 'rotation' else f'{axis_letter.upper()}軸並進軸'
         posture_subtabs.addTab(motion_widget, tab_label)
@@ -1128,6 +1557,15 @@ class Tab2Widget(QWidget):
             'motion_widget': motion_widget,
             'joint_type': joint_type,
         }
+
+        # 軸内のサブタブ（姿勢1/2/3 / motion-axis）切替時に共有カメラを反映
+        posture_subtabs.currentChanged.connect(
+            lambda _idx, l=axis_letter: self._on_axis_subtab_changed(l)
+        )
+
+        # motion-axis のキャッシュを復元（STL は async で読み込まれるため、
+        # 描画は _on_mesh_loaded から再トリガーされる）
+        self._load_motion_axis_cache(motion_widget)
 
         return widget
 
@@ -1164,6 +1602,16 @@ class Tab2Widget(QWidget):
 
         compute_btn = QPushButton(f'{widget.motion_label_jp}を計算 / 表示更新')
         left_layout.addWidget(compute_btn)
+
+        # === 視点記録ボタン ===
+        view_btn_row = QHBoxLayout()
+        record_view_btn = QPushButton('視点を記録')
+        restore_view_btn = QPushButton('記録視点に戻す')
+        view_btn_row.addWidget(record_view_btn)
+        view_btn_row.addWidget(restore_view_btn)
+        left_layout.addLayout(view_btn_row)
+        record_view_btn.clicked.connect(lambda: self._record_view(widget))
+        restore_view_btn.clicked.connect(lambda: self._restore_recorded_view(widget))
 
         opacity_group = QGroupBox('STL 透明度')
         opacity_layout = QVBoxLayout(opacity_group)
@@ -1219,6 +1667,7 @@ class Tab2Widget(QWidget):
         widget.unify_stl_color = False
         widget.stl_visibility = {f'姿勢{i}': True for i in (1, 2, 3)}
         widget.caxis_visibility = {f'姿勢{i}': True for i in (1, 2, 3)}
+        widget.show_cworld = True
 
         if enable_posture_controls:
             posture_view_group = QGroupBox('姿勢変化を分かりやすくする')
@@ -1227,6 +1676,10 @@ class Tab2Widget(QWidget):
             unify_cb = QCheckBox('色を統一')
             unify_cb.setChecked(False)
             pv_layout.addWidget(unify_cb)
+
+            cworld_cb = QCheckBox('C_world を表示')
+            cworld_cb.setChecked(True)
+            pv_layout.addWidget(cworld_cb)
 
             stl_cbs = {}
             caxis_cbs = {}
@@ -1247,11 +1700,15 @@ class Tab2Widget(QWidget):
             left_layout.addWidget(posture_view_group)
 
             widget.unify_color_cb = unify_cb
+            widget.cworld_cb = cworld_cb
             widget.stl_visibility_cbs = stl_cbs
             widget.caxis_visibility_cbs = caxis_cbs
 
             unify_cb.toggled.connect(
                 lambda c, w=widget: self._on_posture_view_toggled(w, 'unify', None, c)
+            )
+            cworld_cb.toggled.connect(
+                lambda c, w=widget: self._on_posture_view_toggled(w, 'cworld', None, c)
             )
             for p, cb in stl_cbs.items():
                 cb.toggled.connect(
@@ -1296,10 +1753,13 @@ class Tab2Widget(QWidget):
         main_layout.addWidget(log_view, 1)
 
         widget.plotter = plotter
+        widget.display_in_world_frame = True  # motion-axis タブは C_world 系で表示
+        self._attach_camera_observer(widget)
         widget.log_view = log_view
         widget.compute_btn = compute_btn
         widget.sliders = sliders
         widget.motion_axis = None
+        widget.needs_update = False
         widget.bounds_all = None
         self.visual_widgets.append(widget)
 
@@ -1321,6 +1781,8 @@ class Tab2Widget(QWidget):
     def _on_posture_view_toggled(self, widget, kind, posture_label, checked):
         if kind == 'unify':
             widget.unify_stl_color = bool(checked)
+        elif kind == 'cworld':
+            widget.show_cworld = bool(checked)
         elif kind == 'stl':
             if not hasattr(widget, 'stl_visibility'):
                 widget.stl_visibility = {}
@@ -1549,6 +2011,8 @@ class Tab2Widget(QWidget):
                 f'∠(Δ_12, Δ_13) = {_deg(d_12, d_13_s):.4f}° (理想 0°)'
             )
 
+        widget.needs_update = False
+        self._save_motion_axis_cache(widget)
         self._render_motion_view(widget)
 
     def _render_motion_view(self, widget):
@@ -1563,17 +2027,47 @@ class Tab2Widget(QWidget):
         plotter.hide_axes()
 
         rot = getattr(widget, 'motion_axis', None)
-        if rot is None:
+        needs_update = bool(getattr(widget, 'needs_update', False))
+        posture_widgets = getattr(widget, 'posture_widgets', {})
+        postures = ['姿勢1', '姿勢2', '姿勢3']
+        all_meshes_loaded = all(
+            getattr(posture_widgets.get(p), 'current_mesh', None) is not None
+            for p in postures
+        )
+        motion_label_jp = getattr(widget, 'motion_label_jp', '回転軸')
+
+        # 表示できない状態を判定して、ガイダンス文だけ描画して返す
+        if needs_update or rot is None or not all_meshes_loaded:
+            if needs_update:
+                main_msg = '更新が必要です'
+                sub_msg = (
+                    f'姿勢1/2/3 のいずれかが更新されました。\n'
+                    f'「{motion_label_jp}を計算 / 表示更新」をクリックしてください。'
+                )
+            elif rot is None:
+                main_msg = '未計算'
+                sub_msg = f'「{motion_label_jp}を計算 / 表示更新」をクリックしてください。'
+            else:  # not all_meshes_loaded
+                main_msg = 'STL 読み込み中…'
+                sub_msg = '姿勢1/2/3 のSTL読み込み完了をお待ちください。'
+            try:
+                plotter.add_text(main_msg, position='upper_edge', font_size=18,
+                                 color='#ffd060', name='motion_msg_main')
+            except Exception:
+                pass
+            try:
+                plotter.add_text(sub_msg, position='lower_edge', font_size=11,
+                                 color='#cfd6e0', name='motion_msg_sub')
+            except Exception:
+                pass
             plotter.render()
             return
 
         axis_letter = getattr(widget, 'axis_letter', 'u')
         motion_name = getattr(widget, 'motion_name', f'{axis_letter.upper()}_motion-axis')
         local_label_prefix = f'C_{axis_letter}-axis'
-        posture_widgets = getattr(widget, 'posture_widgets', {})
 
         T_list = rot['T_stl_to_world']
-        postures = ['姿勢1', '姿勢2', '姿勢3']
         # 姿勢ごとに異なる淡い色で重ねる
         stl_colors = {
             '姿勢1': '#ffc070',
@@ -1636,37 +2130,40 @@ class Tab2Widget(QWidget):
             bounds_all[5] - bounds_all[4],
         ])) or 100.0
 
-        # C_world の座標軸（原点 = 0, 単位ベクトル）
+        # C_world の座標軸（原点 = 0, 単位ベクトル）— トグルで非表示にできる
+        show_cworld = getattr(widget, 'show_cworld', True)
         axis_len_world = max(diag * 0.18, 1.0)
-        for name, vec, color in (
-            ('cw_x', np.array([1.0, 0.0, 0.0]), '#ff3030'),
-            ('cw_y', np.array([0.0, 1.0, 0.0]), '#3060ff'),
-            ('cw_z', np.array([0.0, 0.0, 1.0]), '#30c030'),
-        ):
+        if show_cworld:
+            for name, vec, color in (
+                ('cw_x', np.array([1.0, 0.0, 0.0]), '#ff3030'),
+                ('cw_y', np.array([0.0, 1.0, 0.0]), '#3060ff'),
+                ('cw_z', np.array([0.0, 0.0, 1.0]), '#30c030'),
+            ):
+                try:
+                    arrow = pv.Arrow(start=np.zeros(3), direction=vec, scale=axis_len_world,
+                                     shaft_radius=0.012, tip_radius=0.04, tip_length=0.18)
+                    plotter.add_mesh(arrow, name=name, color=color, pickable=False, reset_camera=False, render=False)
+                except Exception:
+                    pass
+        if show_cworld:
+            # C_world ラベル
             try:
-                arrow = pv.Arrow(start=np.zeros(3), direction=vec, scale=axis_len_world,
-                                 shaft_radius=0.012, tip_radius=0.04, tip_length=0.18)
-                plotter.add_mesh(arrow, name=name, color=color, pickable=False, reset_camera=False, render=False)
+                offs = axis_len_world * 0.12
+                plotter.add_point_labels(
+                    np.array([[offs, offs, offs]], dtype=float),
+                    ['C_world'],
+                    name='cw_label',
+                    font_size=14,
+                    text_color='#bfe4ff',
+                    point_size=0,
+                    shape=None,
+                    always_visible=True,
+                    pickable=False,
+                    reset_camera=False,
+                    render=False,
+                )
             except Exception:
                 pass
-        # C_world ラベル
-        try:
-            offs = axis_len_world * 0.12
-            plotter.add_point_labels(
-                np.array([[offs, offs, offs]], dtype=float),
-                ['C_world'],
-                name='cw_label',
-                font_size=14,
-                text_color='#bfe4ff',
-                point_size=0,
-                shape=None,
-                always_visible=True,
-                pickable=False,
-                reset_camera=False,
-                render=False,
-            )
-        except Exception:
-            pass
 
         # 各姿勢の C_local-axis を C_world 上で薄く表示（参考）
         caxis_visibility = getattr(widget, 'caxis_visibility', {})
@@ -1754,7 +2251,12 @@ class Tab2Widget(QWidget):
             except Exception:
                 pass
 
-        plotter.reset_camera(bounds=bounds_all)
+        # 共有カメラがあればそれを適用、なければデフォルトの bounds fit
+        if not self._set_camera_from_shared(widget):
+            try:
+                plotter.reset_camera(bounds=bounds_all)
+            except Exception:
+                pass
         plotter.render()
 
     def _create_plane_point_controls_widget(self, plane_label: str, plane_title: str) -> QWidget:
@@ -1818,6 +2320,16 @@ class Tab2Widget(QWidget):
         clear_world_btn.setEnabled(False)
         left_layout.addWidget(clear_world_btn)
 
+        # === 視点記録ボタン ===
+        view_btn_row = QHBoxLayout()
+        record_view_btn = QPushButton('視点を記録')
+        restore_view_btn = QPushButton('記録視点に戻す')
+        view_btn_row.addWidget(record_view_btn)
+        view_btn_row.addWidget(restore_view_btn)
+        left_layout.addLayout(view_btn_row)
+        record_view_btn.clicked.connect(lambda: self._record_view(widget))
+        restore_view_btn.clicked.connect(lambda: self._restore_recorded_view(widget))
+
         # === 右パネル: 共有 3D ビュー ===
         if HAS_PYVISTA:
             plotter = QtInteractor(widget)
@@ -1832,6 +2344,8 @@ class Tab2Widget(QWidget):
             right_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         widget.plotter = plotter
+        widget.display_in_world_frame = False  # posture STL は自前の座標系で表示
+        self._attach_camera_observer(widget)
 
         # === 下段: ログビュー（全幅） ===
         log_view = QTextEdit()
@@ -1964,6 +2478,11 @@ class Tab2Widget(QWidget):
             widget.log_view.append('完了')
             widget.load_btn.setEnabled(True)
             self._save_posture_cache(widget)
+            # 新規 STL ロード（非 preserve）はソース変更 → motion-axis を無効化
+            if not preserve:
+                self._invalidate_motion_for_posture(widget)
+            # 同軸の motion-axis を再描画（3 姿勢の STL が揃っていれば描く）
+            self._maybe_render_motion_after_mesh_load(widget)
 
         def _on_load_error(msg: str):
             widget.log_view.append(msg)
@@ -2309,7 +2828,9 @@ class Tab2Widget(QWidget):
         self._draw_c_axis(posture_widget)
 
         if reset_view:
-            plotter.reset_camera(bounds=posture_widget.current_mesh.bounds)
+            bounds = posture_widget.current_mesh.bounds
+            if not self._set_camera_from_shared(posture_widget):
+                plotter.reset_camera(bounds=bounds)
         elif camera_position is not None:
             try:
                 plotter.camera_position = camera_position
@@ -2624,6 +3145,7 @@ class Tab2Widget(QWidget):
         posture_widget.clear_axis_btn.setEnabled(True)
         self._render_posture1_plotter(posture_widget, reset_view=False)
         self._save_posture_cache(posture_widget)
+        self._invalidate_motion_for_posture(posture_widget)
 
     def _build_c_world_axis(self, posture_widget):
         plane_keys = ['W平面1（XY平面）', 'W平面2（YZ平面）', 'W平面3（ZX平面）']
@@ -2634,7 +3156,10 @@ class Tab2Widget(QWidget):
         posture_widget.c_world = result
         posture_widget.clear_world_btn.setEnabled(True)
         self._render_posture1_plotter(posture_widget, reset_view=False)
+        # C_world ができたので共有カメラを反映
+        self._apply_shared_camera_with_render(posture_widget)
         self._save_posture_cache(posture_widget)
+        self._invalidate_motion_for_posture(posture_widget)
 
     def _clear_c_axis(self, posture_widget):
         if getattr(posture_widget, 'c_axis', None) is None:
@@ -2645,6 +3170,7 @@ class Tab2Widget(QWidget):
         posture_widget.log_view.append(f'{prefix} 座標系を消去しました。')
         self._render_posture1_plotter(posture_widget, reset_view=False)
         self._save_posture_cache(posture_widget)
+        self._invalidate_motion_for_posture(posture_widget)
 
     def _clear_c_world_axis(self, posture_widget):
         if getattr(posture_widget, 'c_world', None) is None:
@@ -2654,6 +3180,7 @@ class Tab2Widget(QWidget):
         posture_widget.log_view.append('C_world 座標系を消去しました。')
         self._render_posture1_plotter(posture_widget, reset_view=False)
         self._save_posture_cache(posture_widget)
+        self._invalidate_motion_for_posture(posture_widget)
 
     def _draw_c_axis(self, posture_widget):
         """姿勢上の 2 つの座標系（C_u-axis_posi_i と C_world）を 3D ビューに描画。"""
