@@ -105,8 +105,13 @@ class STLLoadWorker(QObject):
 
 
 class Tab2Widget(QWidget):
+    # サブクラス（FEAxisWidget 等）で別の設定キーへ切り替えるためのデフォルト
+    SETTINGS_TOP_KEY = 'tab2'
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        # 設定ファイル中のトップキー（サブクラスでオーバーライド可）
+        self.settings_top_key = type(self).SETTINGS_TOP_KEY
         # 軸ごとに独立した posture_widgets を保持: {'u': {...}, 'v': {...}, 'w': {...}}
         self.axis_data = {}
         self.visual_widgets = []
@@ -666,7 +671,7 @@ class Tab2Widget(QWidget):
     def _load_shared_camera_cache(self):
         try:
             settings = load_settings() or {}
-            sc = (settings.get('tab2') or {}).get('shared_camera_world')
+            sc = (settings.get(self.settings_top_key) or {}).get('shared_camera_world')
             if isinstance(sc, dict) and all(k in sc for k in ('position', 'focal', 'view_up')):
                 self.shared_camera_world = {
                     'position': [float(v) for v in sc['position']],
@@ -681,8 +686,8 @@ class Tab2Widget(QWidget):
             return
         try:
             settings = load_settings() or {}
-            tab2 = settings.setdefault('tab2', {})
-            tab2['shared_camera_world'] = {
+            top = settings.setdefault(self.settings_top_key, {})
+            top['shared_camera_world'] = {
                 'position': [float(v) for v in self.shared_camera_world['position']],
                 'focal': [float(v) for v in self.shared_camera_world['focal']],
                 'view_up': [float(v) for v in self.shared_camera_world['view_up']],
@@ -694,7 +699,7 @@ class Tab2Widget(QWidget):
     def _load_recorded_view_cache(self):
         try:
             settings = load_settings() or {}
-            rv = (settings.get('tab2') or {}).get('recorded_view_world')
+            rv = (settings.get(self.settings_top_key) or {}).get('recorded_view_world')
             if isinstance(rv, dict) and all(k in rv for k in ('position', 'focal', 'view_up')):
                 self.recorded_view_world = {
                     'position': [float(v) for v in rv['position']],
@@ -707,11 +712,11 @@ class Tab2Widget(QWidget):
     def _save_recorded_view_cache(self):
         try:
             settings = load_settings() or {}
-            tab2 = settings.setdefault('tab2', {})
+            top = settings.setdefault(self.settings_top_key, {})
             if self.recorded_view_world is None:
-                tab2.pop('recorded_view_world', None)
+                top.pop('recorded_view_world', None)
             else:
-                tab2['recorded_view_world'] = {
+                top['recorded_view_world'] = {
                     'position': [float(v) for v in self.recorded_view_world['position']],
                     'focal': [float(v) for v in self.recorded_view_world['focal']],
                     'view_up': [float(v) for v in self.recorded_view_world['view_up']],
@@ -768,13 +773,13 @@ class Tab2Widget(QWidget):
             return
         try:
             settings = load_settings() or {}
-            tab2 = settings.setdefault('tab2', {})
+            top = settings.setdefault(self.settings_top_key, {})
             key = f'{axis_letter}_motion'
             mot = getattr(motion_widget, 'motion_axis', None)
             if mot is None:
-                tab2.pop(key, None)
+                top.pop(key, None)
             else:
-                tab2[key] = {
+                top[key] = {
                     'motion_axis': self._serialize_motion_axis(mot),
                     'source_state': self._capture_motion_source_state(motion_widget.posture_widgets),
                     'log_text': motion_widget.log_view.toPlainText(),
@@ -790,7 +795,7 @@ class Tab2Widget(QWidget):
             return
         try:
             settings = load_settings() or {}
-            entry = (settings.get('tab2') or {}).get(f'{axis_letter}_motion') or {}
+            entry = (settings.get(self.settings_top_key) or {}).get(f'{axis_letter}_motion') or {}
         except Exception:
             entry = {}
         if not entry:
@@ -2950,8 +2955,8 @@ class Tab2Widget(QWidget):
             return
         try:
             settings = load_settings() or {}
-            tab2 = settings.setdefault('tab2', {})
-            axis_section = tab2.setdefault(f'{axis_letter}_axis', {})
+            top = settings.setdefault(self.settings_top_key, {})
+            axis_section = top.setdefault(f'{axis_letter}_axis', {})
             posture_entry = axis_section.setdefault(posture_key, {})
 
             stl_path = getattr(posture_widget, 'stl_path', None)
@@ -2995,7 +3000,7 @@ class Tab2Widget(QWidget):
         try:
             settings = load_settings() or {}
             posture_entry = (
-                ((settings.get('tab2') or {}).get(f'{axis_letter}_axis') or {}).get(posture_key) or {}
+                ((settings.get(self.settings_top_key) or {}).get(f'{axis_letter}_axis') or {}).get(posture_key) or {}
             )
         except Exception:
             return ''
@@ -3301,3 +3306,41 @@ class Tab2Widget(QWidget):
         if not path:
             return
         widget._start_load(path)
+
+
+class FEAxisWidget(Tab2Widget):
+    """「呂」タブの中身。
+
+    構造:
+      呂（MainWindow のトップタブ）
+        └ FE軸検証（このウィジェットがホストするサブタブ）
+             └ 姿勢1 / 姿勢2 / 姿勢3 / U軸回転軸
+
+    Ver.2 の U axis と同じ内部構造を、完全に独立した状態・キャッシュ
+    （settings.json のトップキーは 'tab2_fe'）で提供する。
+    """
+
+    SETTINGS_TOP_KEY = 'tab2_fe'
+
+    def __init__(self, parent=None):
+        # Tab2Widget.__init__ は ALL VIEW + 全 6 軸を生成するためバイパスし、
+        # ここでは「FE軸検証」サブタブ 1 枚だけを構築する。
+        QWidget.__init__(self, parent)
+        self.settings_top_key = type(self).SETTINGS_TOP_KEY
+        self.axis_data = {}
+        self.visual_widgets = []
+        self.shared_camera_world = None
+        self.recorded_view_world = None
+        self.all_view_widget = None
+        # 共有カメラ・記録視点は別のキー名で読み書きされるので、main の Ver.2 とは独立
+        self._load_shared_camera_cache()
+        self._load_recorded_view_cache()
+
+        layout = QVBoxLayout(self)
+        # 「FE軸検証」というラベルのサブタブを 1 つだけ持つ QTabWidget を配置。
+        # サブタブの中身は U axis（姿勢1/2/3 + U軸回転軸）と同等。
+        self.top_subtabs = QTabWidget()
+        axis_widget = self._create_axis_tab('u', joint_type='rotation')
+        self.top_subtabs.addTab(axis_widget, 'FE軸検証')
+        layout.addWidget(self.top_subtabs)
+        self.setLayout(layout)
