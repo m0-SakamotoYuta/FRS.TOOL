@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QGroupBox, QRadioButton,
     QButtonGroup, QScrollArea, QPushButton, QFileDialog, QTextEdit, QListWidget,
-    QSlider, QSpinBox, QCheckBox
+    QSlider, QSpinBox, QCheckBox, QLineEdit
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal
 from PyQt6.QtGui import QColor
@@ -112,6 +112,8 @@ class Tab2Widget(QWidget):
         super().__init__(parent)
         # 設定ファイル中のトップキー（サブクラスでオーバーライド可）
         self.settings_top_key = type(self).SETTINGS_TOP_KEY
+        # FE 専用 UI（座標系名の自由入力 / 軸の太さ・長さスライダー / ボタンラベル差し替え）
+        self.fe_mode = False
         # 軸ごとに独立した posture_widgets を保持: {'u': {...}, 'v': {...}, 'w': {...}}
         self.axis_data = {}
         self.visual_widgets = []
@@ -2172,12 +2174,17 @@ class Tab2Widget(QWidget):
 
         # 各姿勢の C_local-axis を C_world 上で薄く表示（参考）
         caxis_visibility = getattr(widget, 'caxis_visibility', {})
-        axis_len_local = max(diag * 0.12, 1.0)
+        axis_len_local_base = max(diag * 0.12, 1.0)
         for i, p in enumerate(postures, 1):
             if not caxis_visibility.get(p, True):
                 continue
             R_lw = rot['R_local_world'][i - 1]
             O_lw = rot['O_local_world'][i - 1]
+            # 各 posture 個別の太さ・長さ係数（FE モードでスライダー操作可能）
+            pw = posture_widgets.get(p)
+            p_len = float(getattr(pw, 'axis_length_factor', 1.0) or 1.0) if pw else 1.0
+            p_rad = float(getattr(pw, 'axis_radius_factor', 1.0) or 1.0) if pw else 1.0
+            axis_len_local = axis_len_local_base * p_len
             for k, (col_idx, color) in enumerate((
                 (0, '#ff8080'),  # X 軸
                 (1, '#8080ff'),  # Y 軸
@@ -2186,7 +2193,7 @@ class Tab2Widget(QWidget):
                 try:
                     arrow = pv.Arrow(
                         start=O_lw, direction=R_lw[:, col_idx], scale=axis_len_local,
-                        shaft_radius=0.010, tip_radius=0.035, tip_length=0.18,
+                        shaft_radius=0.010 * p_rad, tip_radius=0.035 * p_rad, tip_length=0.18,
                     )
                     plotter.add_mesh(arrow, name=f'cloc_{i}_{k}', color=color, opacity=0.85,
                                      pickable=False, reset_camera=False, render=False)
@@ -2195,9 +2202,11 @@ class Tab2Widget(QWidget):
             try:
                 offs = axis_len_local * 0.15
                 label_pos = O_lw + np.array([offs, offs, offs])
+                # 個別 posture の c_axis_name（FE では QLineEdit で書き換え可能）を使う
+                label_text = getattr(pw, 'c_axis_name', None) or f'{local_label_prefix}_posi{i}'
                 plotter.add_point_labels(
                     np.array([label_pos], dtype=float),
-                    [f'{local_label_prefix}_posi{i}'],
+                    [label_text],
                     name=f'cloc_label_{i}',
                     font_size=12,
                     text_color='#ffe0a0',
@@ -2309,13 +2318,168 @@ class Tab2Widget(QWidget):
         load_btn = QPushButton('STLを読み込む')
         left_layout.addWidget(load_btn)
 
-        build_axis_btn = QPushButton(f'{widget.c_axis_label_prefix} 座標系を生成')
+        is_fe = bool(getattr(self, 'fe_mode', False))
+        if is_fe:
+            build_axis_label = 'ローカル座標系を生成'
+            clear_axis_label = 'ローカル座標系を消去'
+        else:
+            build_axis_label = f'{widget.c_axis_label_prefix} 座標系を生成'
+            clear_axis_label = f'{widget.c_axis_label_prefix} 座標系を消去'
+
+        build_axis_btn = QPushButton(build_axis_label)
         build_axis_btn.setEnabled(False)
         left_layout.addWidget(build_axis_btn)
 
-        clear_axis_btn = QPushButton(f'{widget.c_axis_label_prefix} 座標系を消去')
+        clear_axis_btn = QPushButton(clear_axis_label)
         clear_axis_btn.setEnabled(False)
         left_layout.addWidget(clear_axis_btn)
+
+        # FE 専用: 座標系名（キャプション）の自由入力
+        axis_name_edit = None
+        origin_name_edit = None
+        if is_fe:
+            # 座標系名（軸の脇に表示するラベル）
+            name_row = QHBoxLayout()
+            name_row.addWidget(QLabel('座標系名:'))
+            axis_name_edit = QLineEdit(widget.c_axis_name)
+            axis_name_edit.setPlaceholderText('例: C_u-axis_posi1 / FE_origin / ...')
+            name_row.addWidget(axis_name_edit, 1)
+            left_layout.addLayout(name_row)
+
+            # 原点名（原点位置に直接表示するラベル、任意）
+            origin_name_row = QHBoxLayout()
+            origin_name_row.addWidget(QLabel('原点名:'))
+            origin_name_edit = QLineEdit('')
+            origin_name_edit.setPlaceholderText('原点に表示する名前（任意）')
+            origin_name_row.addWidget(origin_name_edit, 1)
+            left_layout.addLayout(origin_name_row)
+            widget.origin_name = ''
+
+            def _refresh_label_after_text_change(w):
+                try:
+                    self._render_posture1_plotter(w, reset_view=False)
+                except Exception:
+                    pass
+                try:
+                    if getattr(w, 'axis_letter', None) in self.axis_data:
+                        mw = self.axis_data[w.axis_letter].get('motion_widget')
+                        if mw is not None:
+                            self._render_motion_view(mw)
+                except Exception:
+                    pass
+
+            def _on_axis_name_changed(text, w=widget):
+                w.c_axis_name = text or ''
+                _refresh_label_after_text_change(w)
+            axis_name_edit.textChanged.connect(_on_axis_name_changed)
+
+            def _on_origin_name_changed(text, w=widget):
+                w.origin_name = text or ''
+                _refresh_label_after_text_change(w)
+            origin_name_edit.textChanged.connect(_on_origin_name_changed)
+
+        # FE 専用: 座標軸の太さ・長さ・点・原点球の大きさスライダー
+        axis_length_slider = axis_length_spin = None
+        axis_radius_slider = axis_radius_spin = None
+        point_size_slider = point_size_spin = None
+        origin_size_slider = origin_size_spin = None
+        if is_fe:
+            arrow_ctrl_group = QGroupBox('見た目の調整（このタブのみ）')
+            arrow_layout = QVBoxLayout(arrow_ctrl_group)
+
+            def _make_slider_row(label_text, range_max, default_pct):
+                row = QHBoxLayout()
+                lbl = QLabel(label_text)
+                lbl.setMinimumWidth(48)
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setRange(10, range_max)
+                slider.setValue(default_pct)
+                spin = QSpinBox()
+                spin.setRange(10, range_max)
+                spin.setValue(default_pct)
+                spin.setSuffix('%')
+                spin.setMinimumWidth(70)
+                slider.valueChanged.connect(spin.setValue)
+                spin.valueChanged.connect(slider.setValue)
+                row.addWidget(lbl)
+                row.addWidget(slider, 1)
+                row.addWidget(spin)
+                return row, slider, spin
+
+            row, axis_length_slider, axis_length_spin = _make_slider_row('軸長さ:', 300, 100)
+            arrow_layout.addLayout(row)
+
+            row, axis_radius_slider, axis_radius_spin = _make_slider_row('軸太さ:', 500, 100)
+            arrow_layout.addLayout(row)
+
+            # プロットした点（平面ピックの球）の大きさ
+            row, point_size_slider, point_size_spin = _make_slider_row('点:', 500, 100)
+            arrow_layout.addLayout(row)
+
+            # 原点球の大きさ（C_axis / C_world それぞれの原点）
+            row, origin_size_slider, origin_size_spin = _make_slider_row('原点:', 500, 100)
+            arrow_layout.addLayout(row)
+
+            left_layout.addWidget(arrow_ctrl_group)
+
+            widget.axis_length_factor = 1.0
+            widget.axis_radius_factor = 1.0
+            widget.point_size_factor = 1.0
+            widget.origin_size_factor = 1.0
+
+            def _refresh_after_visual_change(w):
+                try:
+                    self._render_posture1_plotter(w, reset_view=False)
+                except Exception:
+                    pass
+                try:
+                    if getattr(w, 'axis_letter', None) in self.axis_data:
+                        mw = self.axis_data[w.axis_letter].get('motion_widget')
+                        if mw is not None:
+                            self._render_motion_view(mw)
+                except Exception:
+                    pass
+
+            def _on_axis_length_changed(v, w=widget):
+                w.axis_length_factor = v / 100.0
+                _refresh_after_visual_change(w)
+
+            def _on_axis_radius_changed(v, w=widget):
+                w.axis_radius_factor = v / 100.0
+                _refresh_after_visual_change(w)
+
+            def _on_point_size_changed(v, w=widget):
+                w.point_size_factor = v / 100.0
+                _refresh_after_visual_change(w)
+
+            def _on_origin_size_changed(v, w=widget):
+                w.origin_size_factor = v / 100.0
+                _refresh_after_visual_change(w)
+
+            axis_length_slider.valueChanged.connect(_on_axis_length_changed)
+            axis_radius_slider.valueChanged.connect(_on_axis_radius_changed)
+            point_size_slider.valueChanged.connect(_on_point_size_changed)
+            origin_size_slider.valueChanged.connect(_on_origin_size_changed)
+
+        # Ver.2 互換: FE モードでないときも属性は持たせる（描画側のフォールバック用）
+        widget.axis_length_factor = getattr(widget, 'axis_length_factor', 1.0)
+        widget.axis_radius_factor = getattr(widget, 'axis_radius_factor', 1.0)
+        widget.point_size_factor = getattr(widget, 'point_size_factor', 1.0)
+        widget.origin_size_factor = getattr(widget, 'origin_size_factor', 1.0)
+        widget.origin_name = getattr(widget, 'origin_name', '')
+        if axis_name_edit is not None:
+            widget.axis_name_edit = axis_name_edit
+        if origin_name_edit is not None:
+            widget.origin_name_edit = origin_name_edit
+        if axis_length_slider is not None:
+            widget.axis_length_slider = axis_length_slider
+            widget.axis_length_spin = axis_length_spin
+            widget.axis_radius_slider = axis_radius_slider
+            widget.axis_radius_spin = axis_radius_spin
+            widget.point_size_slider = point_size_slider
+            widget.point_size_spin = point_size_spin
+            widget.origin_size_slider = origin_size_slider
+            widget.origin_size_spin = origin_size_spin
 
         build_world_btn = QPushButton('C_world 座標系を生成')
         build_world_btn.setEnabled(False)
@@ -2750,6 +2914,9 @@ class Tab2Widget(QWidget):
         )
         plotter.hide_axes()
 
+        # FE タブのみ点サイズスライダーが反映される（Ver.2 は factor=1.0）
+        pt_factor = float(getattr(posture_widget, 'point_size_factor', 1.0) or 1.0)
+
         plane_colors = {
             '平面1（XY平面）': '#ff0000',
             '平面2（YZ平面）': '#0000ff',
@@ -2767,7 +2934,7 @@ class Tab2Widget(QWidget):
                     pv.PolyData(points_array),
                     name=f'plane_points::{plane_label}',
                     color=plane_colors.get(plane_label, '#ffffff'),
-                    point_size=12,
+                    point_size=max(1, int(round(12 * pt_factor))),
                     render_points_as_spheres=True,
                     style='points',
                     pickable=False,
@@ -2787,7 +2954,7 @@ class Tab2Widget(QWidget):
                     pv.PolyData(selected),
                     name='selected_point',
                     color='#ffff66',
-                    point_size=18,
+                    point_size=max(1, int(round(18 * pt_factor))),
                     render_points_as_spheres=True,
                     style='points',
                     pickable=False,
@@ -3202,6 +3369,11 @@ class Tab2Widget(QWidget):
             diag = 100.0
         axis_len = max(diag * 0.2, 1.0)
 
+        # c_axis（ローカル座標系）にのみユーザー定義の太さ・長さ係数を適用。
+        # c_world は常に既定値（FE タブでも変更されない）。
+        len_factor = float(getattr(posture_widget, 'axis_length_factor', 1.0) or 1.0)
+        rad_factor = float(getattr(posture_widget, 'axis_radius_factor', 1.0) or 1.0)
+
         systems = [
             {
                 'key': 'c_axis',
@@ -3211,6 +3383,8 @@ class Tab2Widget(QWidget):
                 'origin_color': '#ffff66',
                 'arrow_colors': ('#ff3030', '#3060ff', '#30c030'),  # X red / Y blue / Z green
                 'actor_prefix': 'c_axis',
+                'length_factor': len_factor,
+                'radius_factor': rad_factor,
             },
             {
                 'key': 'c_world',
@@ -3221,13 +3395,15 @@ class Tab2Widget(QWidget):
                 # 同色だと混乱するが、ユーザー指定の規約（X=赤 / Y=青 / Z=緑）に揃える
                 'arrow_colors': ('#ff3030', '#3060ff', '#30c030'),
                 'actor_prefix': 'c_world',
+                'length_factor': 1.0,
+                'radius_factor': 1.0,
             },
         ]
 
         for sys_def in systems:
             prefix = sys_def['actor_prefix']
             # 既存アクター除去
-            for suffix in ('_x', '_y', '_z', '_origin', '_label'):
+            for suffix in ('_x', '_y', '_z', '_origin', '_label', '_origin_label'):
                 try:
                     plotter.remove_actor(prefix + suffix)
                 except Exception:
@@ -3239,6 +3415,8 @@ class Tab2Widget(QWidget):
 
             origin = frame['origin']
             cx, cy, cz = sys_def['arrow_colors']
+            this_axis_len = axis_len * sys_def.get('length_factor', 1.0)
+            r_f = sys_def.get('radius_factor', 1.0)
             for suffix, vec, color in (
                 ('_x', frame['ex'], cx),
                 ('_y', frame['ey'], cy),
@@ -3248,9 +3426,9 @@ class Tab2Widget(QWidget):
                     arrow = pv.Arrow(
                         start=origin,
                         direction=vec,
-                        scale=axis_len,
-                        shaft_radius=0.015,
-                        tip_radius=0.045,
+                        scale=this_axis_len,
+                        shaft_radius=0.015 * r_f,
+                        tip_radius=0.045 * r_f,
                         tip_length=0.20,
                     )
                     plotter.add_mesh(
@@ -3265,11 +3443,12 @@ class Tab2Widget(QWidget):
                     pass
 
             try:
+                origin_factor = float(getattr(posture_widget, 'origin_size_factor', 1.0) or 1.0)
                 plotter.add_mesh(
                     pv.PolyData(np.array([origin], dtype=float)),
                     name=prefix + '_origin',
                     color=sys_def['origin_color'],
-                    point_size=14,
+                    point_size=max(1, int(round(14 * origin_factor))),
                     render_points_as_spheres=True,
                     style='points',
                     pickable=False,
@@ -3280,7 +3459,7 @@ class Tab2Widget(QWidget):
                 pass
 
             # 座標系名のラベル（原点から軸長 10% オフセット）
-            label_offset = axis_len * 0.10
+            label_offset = this_axis_len * 0.10
             label_pos = np.array(origin, dtype=float) + np.array(
                 [label_offset, label_offset, label_offset], dtype=float
             )
@@ -3300,6 +3479,32 @@ class Tab2Widget(QWidget):
                 )
             except Exception:
                 pass
+
+            # 原点名のラベル（FE タブ専用、c_axis にのみ表示。原点位置に直接配置）
+            if prefix == 'c_axis':
+                origin_name = (getattr(posture_widget, 'origin_name', '') or '').strip()
+                if origin_name:
+                    # 軸ラベルと重ならないよう、反対方向に少しオフセット
+                    op_offset = this_axis_len * 0.06
+                    op_pos = np.array(origin, dtype=float) - np.array(
+                        [op_offset, op_offset, op_offset], dtype=float
+                    )
+                    try:
+                        plotter.add_point_labels(
+                            np.array([op_pos], dtype=float),
+                            [origin_name],
+                            name=prefix + '_origin_label',
+                            font_size=16,
+                            text_color='#ffffff',
+                            point_size=0,
+                            shape=None,
+                            always_visible=True,
+                            pickable=False,
+                            reset_camera=False,
+                            render=False,
+                        )
+                    except Exception:
+                        pass
 
     def _open_posture_file(self, widget):
         path, _ = QFileDialog.getOpenFileName(widget, 'STLファイルを開く', '', 'STL Files (*.stl)')
@@ -3327,6 +3532,8 @@ class FEAxisWidget(Tab2Widget):
         # ここでは「FE軸検証」サブタブ 1 枚だけを構築する。
         QWidget.__init__(self, parent)
         self.settings_top_key = type(self).SETTINGS_TOP_KEY
+        # FE 専用 UI を有効化（_create_axis_tab 呼び出しより前にセット）
+        self.fe_mode = True
         self.axis_data = {}
         self.visual_widgets = []
         self.shared_camera_world = None
