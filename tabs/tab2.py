@@ -108,12 +108,24 @@ class Tab2Widget(QWidget):
     # サブクラス（FEAxisWidget 等）で別の設定キーへ切り替えるためのデフォルト
     SETTINGS_TOP_KEY = 'tab2'
 
+    # 姿勢数とラベル定義（U/V/W/X/Y/Z 各軸で共通）。サブクラスで上書き可。
+    POSTURE_SPECS = [
+        ('姿勢1', '', 'posture1'),
+        ('姿勢2', '', 'posture2'),
+        ('姿勢3', '', 'posture3'),
+        ('姿勢4', '', 'posture4'),
+        ('姿勢5', '', 'posture5'),
+    ]
+    POSTURE_LABELS = ['姿勢1', '姿勢2', '姿勢3', '姿勢4', '姿勢5']
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # 設定ファイル中のトップキー（サブクラスでオーバーライド可）
         self.settings_top_key = type(self).SETTINGS_TOP_KEY
         # FE 専用 UI（座標系名の自由入力 / 軸の太さ・長さスライダー / ボタンラベル差し替え）
         self.fe_mode = False
+        # 3D テキスト用の日本語フォント（メイリオ優先）
+        self._jp_font_path = self._detect_jp_font()
         # 軸ごとに独立した posture_widgets を保持: {'u': {...}, 'v': {...}, 'w': {...}}
         self.axis_data = {}
         self.visual_widgets = []
@@ -216,6 +228,96 @@ class Tab2Widget(QWidget):
                     thread.wait(1000)
                 except Exception:
                     pass
+
+    def _detect_jp_font(self):
+        """日本語フォントのパスを検出する。優先順位: メイリオ > 游ゴシック > MS ゴシック。"""
+        candidates = [
+            r'C:\Windows\Fonts\meiryo.ttc',
+            r'C:\Windows\Fonts\meiryob.ttc',
+            r'C:\Windows\Fonts\YuGothM.ttc',
+            r'C:\Windows\Fonts\YuGothR.ttc',
+            r'C:\Windows\Fonts\msgothic.ttc',
+        ]
+        for path in candidates:
+            try:
+                if os.path.isfile(path):
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def _apply_jp_font(self, ret):
+        """add_point_labels / add_text 等の戻り値（actor）に日本語フォントを適用。"""
+        font_path = getattr(self, '_jp_font_path', None)
+        if not font_path:
+            return ret
+        actor = ret
+        if isinstance(ret, (tuple, list)) and ret:
+            actor = ret[-1]
+        if actor is None:
+            return ret
+
+        # 可能なテキストプロパティを集める（add_point_labels / add_text で経路が異なる）
+        text_props = []
+        try:
+            mp = actor.GetMapper()
+            if mp is not None:
+                tp = mp.GetLabelTextProperty()
+                if tp is not None:
+                    text_props.append(tp)
+        except Exception:
+            pass
+        try:
+            tp = actor.GetTextProperty()
+            if tp is not None:
+                text_props.append(tp)
+        except Exception:
+            pass
+
+        for tp in text_props:
+            try:
+                tp.SetFontFamily(4)  # 4 = VTK_FONT_FILE
+                tp.SetFontFile(font_path)
+            except Exception:
+                pass
+        return ret
+
+    def _setup_plotter_jp_fonts(self, plotter):
+        """plotter インスタンスの add_point_labels / add_text をラップして、
+        返ってきた actor へ自動で日本語フォントを適用する。
+        各 QtInteractor 生成直後に呼ぶ。1 度だけラップされる。"""
+        if plotter is None:
+            return
+        if not getattr(self, '_jp_font_path', None):
+            return
+        if getattr(plotter, '_jp_font_wrapped', False):
+            return
+
+        orig_apl = plotter.add_point_labels
+        orig_at = plotter.add_text
+
+        def _wrapped_add_point_labels(*args, **kwargs):
+            ret = orig_apl(*args, **kwargs)
+            try:
+                self._apply_jp_font(ret)
+            except Exception:
+                pass
+            return ret
+
+        def _wrapped_add_text(*args, **kwargs):
+            ret = orig_at(*args, **kwargs)
+            try:
+                self._apply_jp_font(ret)
+            except Exception:
+                pass
+            return ret
+
+        try:
+            plotter.add_point_labels = _wrapped_add_point_labels
+            plotter.add_text = _wrapped_add_text
+            plotter._jp_font_wrapped = True
+        except Exception:
+            pass
 
     def _configure_lights(self, plotter):
         if plotter is None or not HAS_PYVISTA:
@@ -387,6 +489,7 @@ class Tab2Widget(QWidget):
         # === 右パネル: 3D ビュー ===
         if HAS_PYVISTA:
             plotter = QtInteractor(widget)
+            self._setup_plotter_jp_fonts(plotter)
             background_color, _ = self._load_visual_settings()
             plotter.set_background(background_color, top=self._background_top_color(background_color))
             plotter.add_text('STL(base) を読み込んでください', position='upper_left', font_size=10)
@@ -731,7 +834,7 @@ class Tab2Widget(QWidget):
     def _capture_motion_source_state(self, posture_widgets):
         """motion-axis のソースとなる c_axis/c_world のスナップショット。"""
         state = []
-        for p in ('姿勢1', '姿勢2', '姿勢3'):
+        for p in type(self).POSTURE_LABELS:
             pw = posture_widgets.get(p) if posture_widgets else None
             ca = getattr(pw, 'c_axis', None) if pw else None
             cw = getattr(pw, 'c_world', None) if pw else None
@@ -1534,11 +1637,7 @@ class Tab2Widget(QWidget):
         main_layout.addWidget(title)
 
         posture_subtabs = QTabWidget()
-        postures = [
-            ('姿勢1', '例：0°', 'posture1'),
-            ('姿勢2', '例：45°', 'posture2'),
-            ('姿勢3', '例：90°', 'posture3'),
-        ]
+        postures = list(type(self).POSTURE_SPECS)
         posture_widgets = {}
 
         for posture_label, example_text, posture_key in postures:
@@ -1620,11 +1719,72 @@ class Tab2Widget(QWidget):
         record_view_btn.clicked.connect(lambda: self._record_view(widget))
         restore_view_btn.clicked.connect(lambda: self._restore_recorded_view(widget))
 
+        # 既定の表示名（Ver.2 でも同じ既定値を使うが UI からは触れない）
+        widget.cworld_display_name = 'C_world'
+        widget.show_captions = True  # Ver.2 では常に True、UI からは触らない
+
+        # FE 専用: ラベル名（C_world / motion 軸）の自由入力 + キャプション表示トグル
+        if getattr(self, 'fe_mode', False):
+            name_group = QGroupBox('ラベル名（このタブのみ）')
+            name_layout = QVBoxLayout(name_group)
+
+            # キャプション全体の表示/非表示
+            show_caption_cb = QCheckBox('キャプションを表示')
+            show_caption_cb.setChecked(True)
+            name_layout.addWidget(show_caption_cb)
+            widget.show_caption_cb = show_caption_cb
+
+            def _on_show_caption_toggled(checked, w=widget):
+                w.show_captions = bool(checked)
+                try:
+                    self._render_motion_view(w)
+                except Exception:
+                    pass
+            show_caption_cb.toggled.connect(_on_show_caption_toggled)
+
+            cw_row = QHBoxLayout()
+            cw_row.addWidget(QLabel('C_world 名:'))
+            cworld_edit = QLineEdit('C_world')
+            cworld_edit.setPlaceholderText('例: C_world / W_FE / ...')
+            cw_row.addWidget(cworld_edit, 1)
+            name_layout.addLayout(cw_row)
+
+            mn_row = QHBoxLayout()
+            mn_row.addWidget(QLabel(f'{widget.motion_label_jp}名:'))
+            motion_edit = QLineEdit(widget.motion_name)
+            motion_edit.setPlaceholderText('例: U_rotation-axis / FE_rot / ...')
+            mn_row.addWidget(motion_edit, 1)
+            name_layout.addLayout(mn_row)
+
+            left_layout.addWidget(name_group)
+            widget.cworld_name_edit = cworld_edit
+            widget.motion_name_edit = motion_edit
+
+            def _on_cworld_name_changed(text, w=widget):
+                w.cworld_display_name = (text.strip() if text else '') or 'C_world'
+                try:
+                    self._render_motion_view(w)
+                except Exception:
+                    pass
+            cworld_edit.textChanged.connect(_on_cworld_name_changed)
+
+            def _on_motion_name_changed(text, w=widget):
+                stripped = (text or '').strip()
+                # 空文字は無視（既存値を保持）
+                if stripped:
+                    w.motion_name = stripped
+                    try:
+                        self._render_motion_view(w)
+                    except Exception:
+                        pass
+            motion_edit.textChanged.connect(_on_motion_name_changed)
+
         opacity_group = QGroupBox('STL 透明度')
         opacity_layout = QVBoxLayout(opacity_group)
 
         sliders = {}
-        for posture_label, default_val in (('姿勢1', 50), ('姿勢2', 50), ('姿勢3', 50)):
+        for posture_label in type(self).POSTURE_LABELS:
+            default_val = 50
             row = QHBoxLayout()
             lbl = QLabel(f'{posture_label}:')
             lbl.setMinimumWidth(48)
@@ -1671,9 +1831,10 @@ class Tab2Widget(QWidget):
 
         # === 姿勢変化の表示切替（U axis のみ有効化）===
         # デフォルト状態（無効化時も同じデフォルトを使用 → 表示挙動は従来と同じ）
+        _posture_labels = type(self).POSTURE_LABELS
         widget.unify_stl_color = False
-        widget.stl_visibility = {f'姿勢{i}': True for i in (1, 2, 3)}
-        widget.caxis_visibility = {f'姿勢{i}': True for i in (1, 2, 3)}
+        widget.stl_visibility = {lbl: True for lbl in _posture_labels}
+        widget.caxis_visibility = {lbl: True for lbl in _posture_labels}
         widget.show_cworld = True
 
         if enable_posture_controls:
@@ -1690,7 +1851,7 @@ class Tab2Widget(QWidget):
 
             stl_cbs = {}
             caxis_cbs = {}
-            for i in (1, 2, 3):
+            for i in range(1, len(_posture_labels) + 1):
                 p_label = f'姿勢{i}'
                 caxis_label = f'C_{axis_letter}-axis_posi{i}'
                 row = QHBoxLayout()
@@ -1737,6 +1898,7 @@ class Tab2Widget(QWidget):
         # === 右パネル: 3D ビュー ===
         if HAS_PYVISTA:
             plotter = QtInteractor(widget)
+            self._setup_plotter_jp_fonts(plotter)
             background_color, _ = self._load_visual_settings()
             plotter.set_background(background_color, top=self._background_top_color(background_color))
             plotter.add_text(f'「{widget.motion_label_jp}を計算」ボタンを押してください', position='upper_left', font_size=10)
@@ -1853,57 +2015,65 @@ class Tab2Widget(QWidget):
         motion_name = getattr(widget, 'motion_name', f'{axis_letter.upper()}_motion-axis')
         local_prefix = f'C_{axis_letter}-axis'
         posture_widgets = getattr(widget, 'posture_widgets', {})
-        postures = ['姿勢1', '姿勢2', '姿勢3']
+        all_postures = list(type(self).POSTURE_LABELS)
 
-        # 入力検証
-        for p in postures:
+        # 寛容な入力検証: 有効な姿勢（c_axis / c_world / STL のすべてが揃ったもの）を抽出
+        valid = []  # list of (posture_label, posture_widget)
+        for p in all_postures:
             pw = posture_widgets.get(p)
             if pw is None:
-                log.append(f'{p}: ウィジェットが見つかりません。')
-                return
+                continue
             if getattr(pw, 'c_axis', None) is None:
-                log.append(f'{p}: {local_prefix} 座標系が未生成です。各姿勢で先に生成してください。')
-                return
+                log.append(f'{p}: {local_prefix} 未生成のためスキップ')
+                continue
             if getattr(pw, 'c_world', None) is None:
-                log.append(f'{p}: C_world 座標系が未生成です。各姿勢で先に生成してください。')
-                return
+                log.append(f'{p}: C_world 未生成のためスキップ')
+                continue
             if getattr(pw, 'current_mesh', None) is None:
-                log.append(f'{p}: STL が読み込まれていません。')
-                return
+                log.append(f'{p}: STL 未読込のためスキップ')
+                continue
+            valid.append((p, pw))
+
+        if len(valid) < 2:
+            log.append('有効な姿勢が 2 つ以上ありません。各姿勢で STL 読込・C_local・C_world をご準備ください。')
+            return
+
+        log.append(f'有効な姿勢: {", ".join(p for p, _ in valid)} （計 {len(valid)} 個）')
 
         # 各姿勢: STL→World 変換、および C_local の World 表現
         R_local_world = []
         O_local_world = []
         T_stl_to_world = []
-        for p in postures:
-            pw = posture_widgets[p]
+        for _p, pw in valid:
             R_loc = np.column_stack([pw.c_axis['ex'], pw.c_axis['ey'], pw.c_axis['ez']])
             O_loc = np.asarray(pw.c_axis['origin'], dtype=float)
             R_w = np.column_stack([pw.c_world['ex'], pw.c_world['ey'], pw.c_world['ez']])
             O_w = np.asarray(pw.c_world['origin'], dtype=float)
-
             R_w_T = R_w.T
             R_local_world.append(R_w_T @ R_loc)
             O_local_world.append(R_w_T @ (O_loc - O_w))
-
             T = np.eye(4)
             T[:3, :3] = R_w_T
             T[:3, 3] = -R_w_T @ O_w
             T_stl_to_world.append(T)
 
-        # 姿勢間の回転（World 座標系上）
-        R_12 = R_local_world[1] @ R_local_world[0].T
-        R_23 = R_local_world[2] @ R_local_world[1].T
-        R_13 = R_local_world[2] @ R_local_world[0].T
+        N = len(valid)
+        pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
+        # ラベル用に元の姿勢番号も持っておく（valid のインデックス → 「姿勢k」の k を取得）
+        posture_nums = [int(p.replace('姿勢', '')) for p, _ in valid]
 
-        theta_12, axis_12 = self._rotation_log_axis(R_12)
-        theta_23, axis_23 = self._rotation_log_axis(R_23)
-        theta_13, axis_13 = self._rotation_log_axis(R_13)
-
-        # 姿勢間の平行移動（World 座標系上）
-        d_12 = O_local_world[1] - O_local_world[0]
-        d_23 = O_local_world[2] - O_local_world[1]
-        d_13 = O_local_world[2] - O_local_world[0]
+        # 全ペアの R_ij と Δ_ij
+        R_pairs = []
+        theta_list = []
+        axis_list = []
+        d_list = []
+        for (i, j) in pairs:
+            R_ij = R_local_world[j] @ R_local_world[i].T
+            th, ax = self._rotation_log_axis(R_ij)
+            R_pairs.append(R_ij)
+            theta_list.append(th)
+            axis_list.append(ax)
+            d_list.append(O_local_world[j] - O_local_world[i])
 
         def _deg(v, w):
             nv = np.linalg.norm(v); nw = np.linalg.norm(w)
@@ -1912,27 +2082,37 @@ class Tab2Widget(QWidget):
             return float(np.degrees(np.arccos(np.clip(float(np.dot(v / nv, w / nw)), -1.0, 1.0))))
 
         if joint_type == 'rotation':
-            # 軸方向の符号合わせ
-            if np.dot(axis_12, axis_23) < 0:
-                axis_23 = -axis_23
-            if np.dot(axis_12, axis_13) < 0:
-                axis_13 = -axis_13
+            # 軸方向の符号合わせ（最初の axis を基準）
+            ref = axis_list[0].copy()
+            axes_signed = [axis_list[0]]
+            for k in range(1, len(axis_list)):
+                ak = axis_list[k]
+                if np.dot(ak, ref) < 0:
+                    ak = -ak
+                axes_signed.append(ak)
 
-            weights = np.array([theta_12, theta_23, theta_13])
+            weights = np.array(theta_list, dtype=float)
             if weights.sum() < 1e-9:
-                log.append('回転角がほぼゼロです（3 姿勢が同一）。回転軸を確定できません。')
+                log.append('全ペアの回転角がほぼゼロです。回転軸を確定できません。')
                 return
-            avg_dir = weights[0] * axis_12 + weights[1] * axis_23 + weights[2] * axis_13
-            avg_dir = avg_dir / np.linalg.norm(avg_dir)
+            avg_dir = np.zeros(3)
+            for w, a in zip(weights, axes_signed):
+                avg_dir = avg_dir + w * a
+            n_avg = np.linalg.norm(avg_dir)
+            if n_avg < 1e-9:
+                log.append('回転軸の平均方向がゼロです。回転軸を確定できません。')
+                return
+            avg_dir = avg_dir / n_avg
 
             # 回転軸の通る点 p を最小二乗で
             I3 = np.eye(3)
-            A = np.vstack([I3 - R_12, I3 - R_23, I3 - R_13])
-            b = np.concatenate([
-                O_local_world[1] - R_12 @ O_local_world[0],
-                O_local_world[2] - R_23 @ O_local_world[1],
-                O_local_world[2] - R_13 @ O_local_world[0],
-            ])
+            A_blocks = [I3 - R for R in R_pairs]
+            b_blocks = [
+                O_local_world[j] - R_pairs[k] @ O_local_world[i]
+                for k, (i, j) in enumerate(pairs)
+            ]
+            A = np.vstack(A_blocks)
+            b = np.concatenate(b_blocks)
             try:
                 p_axis, _r, _rk, _sv = np.linalg.lstsq(A, b, rcond=None)
             except np.linalg.LinAlgError:
@@ -1946,34 +2126,48 @@ class Tab2Widget(QWidget):
                 'R_local_world': R_local_world,
                 'O_local_world': O_local_world,
                 'T_stl_to_world': T_stl_to_world,
+                'valid_postures': [p for p, _ in valid],
             }
 
-            log.append(f'{motion_name} を計算しました（C_world 座標系上）:')
-            log.append(f'  姿勢1→2: 回転角 = {np.degrees(theta_12):.3f}°, 軸 = ({axis_12[0]:+.4f}, {axis_12[1]:+.4f}, {axis_12[2]:+.4f})')
-            log.append(f'  姿勢2→3: 回転角 = {np.degrees(theta_23):.3f}°, 軸 = ({axis_23[0]:+.4f}, {axis_23[1]:+.4f}, {axis_23[2]:+.4f})')
-            log.append(f'  姿勢1→3: 回転角 = {np.degrees(theta_13):.3f}°, 軸 = ({axis_13[0]:+.4f}, {axis_13[1]:+.4f}, {axis_13[2]:+.4f})')
+            log.append(f'{motion_name} を計算しました（C_world 座標系上, {N} 姿勢, {len(pairs)} ペア）:')
+            for k, (i, j) in enumerate(pairs):
+                ni, nj = posture_nums[i], posture_nums[j]
+                ax = axes_signed[k]
+                log.append(
+                    f'  姿勢{ni}→{nj}: 回転角 = {np.degrees(theta_list[k]):.3f}°, '
+                    f'軸 = ({ax[0]:+.4f}, {ax[1]:+.4f}, {ax[2]:+.4f})'
+                )
             log.append('  --- 統合結果 ---')
             log.append(f'  {motion_name} 方向 = ({avg_dir[0]:+.6f}, {avg_dir[1]:+.6f}, {avg_dir[2]:+.6f})')
             log.append(f'  軸が通る点 (C_world)   = ({p_axis[0]:+.4f}, {p_axis[1]:+.4f}, {p_axis[2]:+.4f})')
-            log.append(
-                f'  3軸候補の方向ずれ: '
-                f'∠(1→2, 2→3)={_deg(axis_12, axis_23):.3f}°, '
-                f'∠(2→3, 1→3)={_deg(axis_23, axis_13):.3f}°, '
-                f'∠(1→2, 1→3)={_deg(axis_12, axis_13):.3f}°（理想 0°）'
-            )
+            log.append('  --- 平均方向からの各候補の方向ずれ（理想 0°） ---')
+            for k, (i, j) in enumerate(pairs):
+                ni, nj = posture_nums[i], posture_nums[j]
+                log.append(f'    ∠(姿勢{ni}→{nj}, 平均) = {_deg(axes_signed[k], avg_dir):.3f}°')
         else:  # translation
-            # 並進方向の符号合わせ
-            d_23_s = d_23 if np.dot(d_12, d_23) >= 0 else -d_23
-            d_13_s = d_13 if np.dot(d_12, d_13) >= 0 else -d_13
+            # 並進方向の符号合わせ（最初の Δ を基準）
+            ref = d_list[0].copy()
+            d_signed = [d_list[0]]
+            for k in range(1, len(d_list)):
+                dk = d_list[k]
+                if np.dot(dk, ref) < 0:
+                    dk = -dk
+                d_signed.append(dk)
 
-            lens = np.array([np.linalg.norm(d_12), np.linalg.norm(d_23_s), np.linalg.norm(d_13_s)])
+            lens = np.array([np.linalg.norm(d) for d in d_signed], dtype=float)
             if lens.sum() < 1e-9:
-                log.append('並進距離がほぼゼロです（3 姿勢が同一原点）。並進軸を確定できません。')
+                log.append('全ペアの並進距離がほぼゼロです。並進軸を確定できません。')
                 return
-            avg_dir = lens[0] * d_12 + lens[1] * d_23_s + lens[2] * d_13_s
-            avg_dir = avg_dir / np.linalg.norm(avg_dir)
+            avg_dir = np.zeros(3)
+            for l, d in zip(lens, d_signed):
+                avg_dir = avg_dir + l * d
+            n_avg = np.linalg.norm(avg_dir)
+            if n_avg < 1e-9:
+                log.append('並進軸の平均方向がゼロです。')
+                return
+            avg_dir = avg_dir / n_avg
 
-            # 軸の通る点: 姿勢1 の C_local 原点を採用
+            # 軸の通る点: 最初の有効な姿勢の C_local 原点を採用
             p_axis = O_local_world[0]
 
             widget.motion_axis = {
@@ -1982,9 +2176,10 @@ class Tab2Widget(QWidget):
                 'R_local_world': R_local_world,
                 'O_local_world': O_local_world,
                 'T_stl_to_world': T_stl_to_world,
+                'valid_postures': [p for p, _ in valid],
             }
 
-            log.append(f'{motion_name} を計算しました（C_world 座標系上）:')
+            log.append(f'{motion_name} を計算しました（C_world 座標系上, {N} 姿勢, {len(pairs)} ペア）:')
             log.append('  ※ 姿勢間の回転行列 R（直動関節なら理想 R = I）と平行移動 Δ を表示します。')
 
             def _fmt_R(R):
@@ -1993,30 +2188,33 @@ class Tab2Widget(QWidget):
                     f'    [{R[1, 0]:+.6f}, {R[1, 1]:+.6f}, {R[1, 2]:+.6f}]',
                     f'    [{R[2, 0]:+.6f}, {R[2, 1]:+.6f}, {R[2, 2]:+.6f}]',
                 ]
-            for label, R, theta, dvec in (
-                ('1→2', R_12, theta_12, d_12),
-                ('2→3', R_23, theta_23, d_23),
-                ('1→3', R_13, theta_13, d_13),
-            ):
-                log.append(f'  --- 姿勢{label} ---')
-                log.append(f'    R_{label.replace("→", "_")} (回転角 = {np.degrees(theta):.4f}°, 理想 0°):')
-                for ln in _fmt_R(R):
+            for k, (i, j) in enumerate(pairs):
+                ni, nj = posture_nums[i], posture_nums[j]
+                R_ij = R_pairs[k]
+                th_ij = theta_list[k]
+                dvec = d_list[k]
+                tag = f'{ni}_{nj}'
+                log.append(f'  --- 姿勢{ni}→{nj} ---')
+                log.append(f'    R_{tag} (回転角 = {np.degrees(th_ij):.4f}°, 理想 0°):')
+                for ln in _fmt_R(R_ij):
                     log.append(ln)
                 log.append(
-                    f'    Δ_{label.replace("→", "_")} = '
+                    f'    Δ_{tag} = '
                     f'({dvec[0]:+.4f}, {dvec[1]:+.4f}, {dvec[2]:+.4f}) [mm], '
                     f'||Δ|| = {np.linalg.norm(dvec):.4f} mm'
                 )
 
             log.append('  --- 統合結果 ---')
             log.append(f'  {motion_name} 方向 = ({avg_dir[0]:+.6f}, {avg_dir[1]:+.6f}, {avg_dir[2]:+.6f})')
-            log.append(f'  軸が通る点 (C_world, 姿勢1 原点) = ({p_axis[0]:+.4f}, {p_axis[1]:+.4f}, {p_axis[2]:+.4f})')
+            first_p = posture_nums[0]
             log.append(
-                f'  3 候補方向のずれ: '
-                f'∠(Δ_12, Δ_23) = {_deg(d_12, d_23_s):.4f}°, '
-                f'∠(Δ_23, Δ_13) = {_deg(d_23_s, d_13_s):.4f}°, '
-                f'∠(Δ_12, Δ_13) = {_deg(d_12, d_13_s):.4f}° (理想 0°)'
+                f'  軸が通る点 (C_world, 姿勢{first_p} 原点) '
+                f'= ({p_axis[0]:+.4f}, {p_axis[1]:+.4f}, {p_axis[2]:+.4f})'
             )
+            log.append('  --- 平均方向からの各候補の方向ずれ（理想 0°） ---')
+            for k, (i, j) in enumerate(pairs):
+                ni, nj = posture_nums[i], posture_nums[j]
+                log.append(f'    ∠(Δ_{ni}_{nj}, 平均) = {_deg(d_signed[k], avg_dir):.4f}°')
 
         widget.needs_update = False
         self._save_motion_axis_cache(widget)
@@ -2036,7 +2234,12 @@ class Tab2Widget(QWidget):
         rot = getattr(widget, 'motion_axis', None)
         needs_update = bool(getattr(widget, 'needs_update', False))
         posture_widgets = getattr(widget, 'posture_widgets', {})
-        postures = ['姿勢1', '姿勢2', '姿勢3']
+        all_postures = list(type(self).POSTURE_LABELS)
+        # rot がある場合は計算に使った姿勢のメッシュが揃っているかで判定
+        if rot is not None and isinstance(rot.get('valid_postures'), list) and rot['valid_postures']:
+            postures = list(rot['valid_postures'])
+        else:
+            postures = all_postures
         all_meshes_loaded = all(
             getattr(posture_widgets.get(p), 'current_mesh', None) is not None
             for p in postures
@@ -2048,7 +2251,7 @@ class Tab2Widget(QWidget):
             if needs_update:
                 main_msg = '更新が必要です'
                 sub_msg = (
-                    f'姿勢1/2/3 のいずれかが更新されました。\n'
+                    f'姿勢1〜{len(all_postures)} のいずれかが更新されました。\n'
                     f'「{motion_label_jp}を計算 / 表示更新」をクリックしてください。'
                 )
             elif rot is None:
@@ -2056,7 +2259,7 @@ class Tab2Widget(QWidget):
                 sub_msg = f'「{motion_label_jp}を計算 / 表示更新」をクリックしてください。'
             else:  # not all_meshes_loaded
                 main_msg = 'STL 読み込み中…'
-                sub_msg = '姿勢1/2/3 のSTL読み込み完了をお待ちください。'
+                sub_msg = '計算済姿勢のSTL読み込み完了をお待ちください。'
             try:
                 plotter.add_text(main_msg, position='upper_edge', font_size=18,
                                  color='#ffd060', name='motion_msg_main')
@@ -2075,11 +2278,18 @@ class Tab2Widget(QWidget):
         local_label_prefix = f'C_{axis_letter}-axis'
 
         T_list = rot['T_stl_to_world']
-        # 姿勢ごとに異なる淡い色で重ねる
+        # 描画対象の姿勢ラベル列（rot に格納された valid_postures を優先）
+        if rot is not None and isinstance(rot.get('valid_postures'), list) and rot['valid_postures']:
+            postures = list(rot['valid_postures'])
+        else:
+            postures = all_postures[: len(T_list)]
+        # 姿勢ごとに異なる淡い色で重ねる（5 姿勢まで）
         stl_colors = {
-            '姿勢1': '#ffc070',
-            '姿勢2': '#80d0a0',
-            '姿勢3': '#a0a0ff',
+            '姿勢1': '#ffc070',  # 橙
+            '姿勢2': '#80d0a0',  # 緑
+            '姿勢3': '#a0a0ff',  # 紫
+            '姿勢4': '#d4d480',  # 黄
+            '姿勢5': '#80d4d4',  # シアン
         }
         stl_visibility = getattr(widget, 'stl_visibility', {})
         unify_color = getattr(widget, 'unify_stl_color', False)
@@ -2139,6 +2349,7 @@ class Tab2Widget(QWidget):
 
         # C_world の座標軸（原点 = 0, 単位ベクトル）— トグルで非表示にできる
         show_cworld = getattr(widget, 'show_cworld', True)
+        show_caps_motion = bool(getattr(widget, 'show_captions', True))
         axis_len_world = max(diag * 0.18, 1.0)
         if show_cworld:
             for name, vec, color in (
@@ -2152,13 +2363,14 @@ class Tab2Widget(QWidget):
                     plotter.add_mesh(arrow, name=name, color=color, pickable=False, reset_camera=False, render=False)
                 except Exception:
                     pass
-        if show_cworld:
+        if show_cworld and show_caps_motion:
             # C_world ラベル
             try:
                 offs = axis_len_world * 0.12
+                cworld_label = getattr(widget, 'cworld_display_name', None) or 'C_world'
                 plotter.add_point_labels(
                     np.array([[offs, offs, offs]], dtype=float),
-                    ['C_world'],
+                    [cworld_label],
                     name='cw_label',
                     font_size=14,
                     text_color='#bfe4ff',
@@ -2199,11 +2411,18 @@ class Tab2Widget(QWidget):
                                      pickable=False, reset_camera=False, render=False)
                 except Exception:
                     pass
+            if not show_caps_motion:
+                continue
             try:
                 offs = axis_len_local * 0.15
                 label_pos = O_lw + np.array([offs, offs, offs])
                 # 個別 posture の c_axis_name（FE では QLineEdit で書き換え可能）を使う
-                label_text = getattr(pw, 'c_axis_name', None) or f'{local_label_prefix}_posi{i}'
+                # フォールバックは実際の姿勢番号で（例: posi3 → ラベル "C_x-axis_posi3"）
+                try:
+                    actual_num = int(p.replace('姿勢', ''))
+                except Exception:
+                    actual_num = i
+                label_text = getattr(pw, 'c_axis_name', None) or f'{local_label_prefix}_posi{actual_num}'
                 plotter.add_point_labels(
                     np.array([label_pos], dtype=float),
                     [label_text],
@@ -2245,7 +2464,7 @@ class Tab2Widget(QWidget):
                                  pickable=False, reset_camera=False, render=False)
             except Exception:
                 pass
-        if show_line:
+        if show_line and show_caps_motion:
             try:
                 label_pos = point + direction * (diag * 0.4)
                 label_pos = label_pos + np.array([diag * 0.03, diag * 0.03, diag * 0.03])
@@ -2387,6 +2606,20 @@ class Tab2Widget(QWidget):
             arrow_ctrl_group = QGroupBox('見た目の調整（このタブのみ）')
             arrow_layout = QVBoxLayout(arrow_ctrl_group)
 
+            # キャプション（文字ラベル）の表示/非表示
+            show_caption_cb = QCheckBox('キャプションを表示')
+            show_caption_cb.setChecked(True)
+            arrow_layout.addWidget(show_caption_cb)
+            widget.show_captions = True
+
+            def _on_show_caption_toggled(checked, w=widget):
+                w.show_captions = bool(checked)
+                try:
+                    self._render_posture1_plotter(w, reset_view=False)
+                except Exception:
+                    pass
+            show_caption_cb.toggled.connect(_on_show_caption_toggled)
+
             def _make_slider_row(label_text, range_max, default_pct):
                 row = QHBoxLayout()
                 lbl = QLabel(label_text)
@@ -2467,6 +2700,7 @@ class Tab2Widget(QWidget):
         widget.point_size_factor = getattr(widget, 'point_size_factor', 1.0)
         widget.origin_size_factor = getattr(widget, 'origin_size_factor', 1.0)
         widget.origin_name = getattr(widget, 'origin_name', '')
+        widget.show_captions = getattr(widget, 'show_captions', True)
         if axis_name_edit is not None:
             widget.axis_name_edit = axis_name_edit
         if origin_name_edit is not None:
@@ -2502,6 +2736,7 @@ class Tab2Widget(QWidget):
         # === 右パネル: 共有 3D ビュー ===
         if HAS_PYVISTA:
             plotter = QtInteractor(widget)
+            self._setup_plotter_jp_fonts(plotter)
             background_color, _ = self._load_visual_settings()
             plotter.set_background(background_color, top=self._background_top_color(background_color))
             plotter.add_text('STLを読み込んでください', position='upper_left', font_size=10)
@@ -3325,6 +3560,16 @@ class Tab2Widget(QWidget):
         result = self._compute_axis_system(pts, posture_widget.log_view, prefix='C_world')
         if result is None:
             return
+        # 呂（FE）タブ専用: C_world の Z 軸（緑）の向きを反転する仕様
+        if getattr(self, 'fe_mode', False):
+            try:
+                result['ez'] = -np.asarray(result['ez'], dtype=float)
+                result['raw_z'] = -np.asarray(result['raw_z'], dtype=float)
+                posture_widget.log_view.append(
+                    '【FE 仕様】C_world の Z 軸（緑）の向きを反転しました。'
+                )
+            except Exception:
+                pass
         posture_widget.c_world = result
         posture_widget.clear_world_btn.setEnabled(True)
         self._render_posture1_plotter(posture_widget, reset_view=False)
@@ -3373,6 +3618,7 @@ class Tab2Widget(QWidget):
         # c_world は常に既定値（FE タブでも変更されない）。
         len_factor = float(getattr(posture_widget, 'axis_length_factor', 1.0) or 1.0)
         rad_factor = float(getattr(posture_widget, 'axis_radius_factor', 1.0) or 1.0)
+        show_caps = bool(getattr(posture_widget, 'show_captions', True))
 
         systems = [
             {
@@ -3463,25 +3709,26 @@ class Tab2Widget(QWidget):
             label_pos = np.array(origin, dtype=float) + np.array(
                 [label_offset, label_offset, label_offset], dtype=float
             )
-            try:
-                plotter.add_point_labels(
-                    np.array([label_pos], dtype=float),
-                    [sys_def['label']],
-                    name=prefix + '_label',
-                    font_size=14,
-                    text_color=sys_def['label_color'],
-                    point_size=0,
-                    shape=None,
-                    always_visible=True,
-                    pickable=False,
-                    reset_camera=False,
-                    render=False,
-                )
-            except Exception:
-                pass
+            if show_caps:
+                try:
+                    plotter.add_point_labels(
+                        np.array([label_pos], dtype=float),
+                        [sys_def['label']],
+                        name=prefix + '_label',
+                        font_size=14,
+                        text_color=sys_def['label_color'],
+                        point_size=0,
+                        shape=None,
+                        always_visible=True,
+                        pickable=False,
+                        reset_camera=False,
+                        render=False,
+                    )
+                except Exception:
+                    pass
 
             # 原点名のラベル（FE タブ専用、c_axis にのみ表示。原点位置に直接配置）
-            if prefix == 'c_axis':
+            if show_caps and prefix == 'c_axis':
                 origin_name = (getattr(posture_widget, 'origin_name', '') or '').strip()
                 if origin_name:
                     # 軸ラベルと重ならないよう、反対方向に少しオフセット
