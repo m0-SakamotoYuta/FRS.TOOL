@@ -1,0 +1,10 @@
+built OK
+u:ALL VIEW/n=7
+v:ALL VIEW/n=7
+w:ALL VIEW/n=7
+x:ALL VIEW/n=7
+y:ALL VIEW/n=7
+z:ALL VIEW/n=7
+mirrors=6
+spec_focal=[15.0, 5.0, 0.0] key=[69.99, 5.0, 0.0]
+mirror_eff_cw_isbase=True

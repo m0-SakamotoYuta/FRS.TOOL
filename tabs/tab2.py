@@ -287,8 +287,8 @@ class Tab2Widget(QWidget):
         self.setLayout(layout)
 
     # 新方式（base STL への RANSAC→ICP フィッティングで重ね合わせ）を使う軸。
-    # 動作確認後に 'v','w' 等へ拡張する。FE タブ（base 無し）は常に旧方式。
-    BASE_FIT_AXES = {'u'}
+    # U〜Z の全軸で有効。FE タブ（base 無し）は常に旧方式。
+    BASE_FIT_AXES = {'u', 'v', 'w', 'x', 'y', 'z'}
 
     def _uses_base_fitting(self, axis_letter) -> bool:
         """指定の軸が新方式（base へのフィッティング）を使うか。"""
@@ -502,6 +502,89 @@ class Tab2Widget(QWidget):
         plotter.add_light(fill)
         plotter.add_light(rim)
 
+    def _world_light_spec(self):
+        """C_world 座標系での共通照明仕様。base STL と C_world が揃っていれば返す。
+
+        定義: base STL の重心を焦点とし、C_world の +X（赤ベクトル＝YZ平面に垂直）方向に
+        キーライトを置く。これにより、どのタブでも同じ照明位置になる。
+        返り値: dict {focal, key, fill, rim}（すべて C_world 座標の点）/ None。
+        """
+        base = getattr(self, 'all_view_widget', None)
+        if base is None:
+            return None
+        base_T = self._base_T_world()  # base STL 座標 → C_world 座標
+        base_mesh = getattr(base, 'current_mesh', None)
+        if base_T is None or base_mesh is None:
+            return None
+        try:
+            c = np.asarray(base_mesh.center, dtype=float)  # base STL 座標での重心(bbox中心)
+            b = base_mesh.bounds
+            diag = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]])) or 100.0
+        except Exception:
+            return None
+        R = base_T[:3, :3]
+        t = base_T[:3, 3]
+        focal_w = R @ c + t  # 重心を C_world 座標へ
+        dist = max(diag * 1.2, 1.0)
+        x = np.array([1.0, 0.0, 0.0])  # C_world +X（赤, YZ平面に垂直）
+        z = np.array([0.0, 0.0, 1.0])
+        return {
+            'focal': focal_w,
+            'key': focal_w + x * dist,
+            'fill': focal_w - x * dist * 0.6,
+            'rim': focal_w + z * dist * 0.6,
+        }
+
+    def _configure_lights_for_widget(self, widget, plotter=None):
+        """ウィジェット（の表示座標系）に、共通の世界照明を変換して適用する。
+        base/C_world が未準備なら従来の固定照明にフォールバック。"""
+        if plotter is None:
+            plotter = getattr(widget, 'plotter', None)
+        if plotter is None or not HAS_PYVISTA:
+            return
+        plotter.remove_all_lights()
+        if not get_lighting_enabled():
+            try:
+                plotter.enable_eye_dome_lighting()
+            except Exception:
+                pass
+            return
+        try:
+            plotter.disable_eye_dome_lighting()
+        except Exception:
+            pass
+
+        spec = self._world_light_spec()
+        in_world = getattr(widget, 'display_in_world_frame', False)
+        cw = None if in_world else self._effective_c_world_for_widget(widget)
+        # 世界照明が使えない / 表示座標への変換ができない → 固定照明
+        if spec is None or (not in_world and cw is None):
+            key = pv.Light(position=(3.0, 2.0, 2.5), focal_point=(0.0, 0.0, 0.0), color='white', intensity=1.0)
+            fill = pv.Light(position=(-2.0, -1.5, 1.5), focal_point=(0.0, 0.0, 0.0), color='#cfd7ff', intensity=0.45)
+            rim = pv.Light(position=(-1.5, 2.5, -2.0), focal_point=(0.0, 0.0, 0.0), color='#fff1d6', intensity=0.35)
+            plotter.add_light(key)
+            plotter.add_light(fill)
+            plotter.add_light(rim)
+            return
+
+        if cw is None:
+            R_w = np.eye(3)
+            O_w = np.zeros(3)
+        else:
+            R_w = np.column_stack([cw['ex'], cw['ey'], cw['ez']])
+            O_w = np.asarray(cw['origin'], dtype=float)
+
+        def to_disp(p_world):
+            return O_w + R_w @ np.asarray(p_world, dtype=float)
+
+        focal = to_disp(spec['focal'])
+        key = pv.Light(position=tuple(to_disp(spec['key'])), focal_point=tuple(focal), color='white', intensity=1.0)
+        fill = pv.Light(position=tuple(to_disp(spec['fill'])), focal_point=tuple(focal), color='#cfd7ff', intensity=0.35)
+        rim = pv.Light(position=tuple(to_disp(spec['rim'])), focal_point=tuple(focal), color='#fff1d6', intensity=0.25)
+        plotter.add_light(key)
+        plotter.add_light(fill)
+        plotter.add_light(rim)
+
     def _add_lighting_toggle(self, left_layout, widget):
         cb = QCheckBox('光源を有効化')
         cb.setChecked(get_lighting_enabled())
@@ -533,6 +616,8 @@ class Tab2Widget(QWidget):
                     self._render_all_view(widget, reset_view=False)
                 else:
                     self._reset_plotter_placeholder(widget.plotter, 'STL(base) を読み込んでください')
+            elif view_kind == 'all_view_mirror':
+                self._render_all_view_mirror(widget)
             elif view_kind == 'posture':
                 if getattr(widget, 'current_mesh', None) is not None:
                     self._render_posture1_plotter(widget, reset_view=False)
@@ -980,6 +1065,8 @@ class Tab2Widget(QWidget):
         self._render_all_view(widget, reset_view=False)
         # C_world ができたので共有カメラを反映
         self._apply_shared_camera_with_render(widget)
+        # base C_world が確定 → 全タブの同期照明を更新
+        self._refresh_all_lighting()
         self._save_posture_cache(widget)
 
     def _clear_c_world_for_all_view(self, widget):
@@ -1042,6 +1129,9 @@ class Tab2Widget(QWidget):
         widget.clear_stl_btn.setEnabled(False)
         widget.log_view.append('STLを消去しました。')
         self._save_posture_cache(widget)
+        # base が消えたのでミラーと同期照明も更新
+        self._sync_all_view_mirrors()
+        self._refresh_all_lighting()
 
     def _clear_posture_stl(self, posture_widget):
         posture_widget.current_mesh = None
@@ -1296,7 +1386,7 @@ class Tab2Widget(QWidget):
         if plotter is None or not HAS_PYVISTA:
             return
         in_world = getattr(widget, 'display_in_world_frame', False)
-        c_world = None if in_world else getattr(widget, 'c_world', None)
+        c_world = None if in_world else self._effective_c_world_for_widget(widget)
         if not in_world and c_world is None:
             if log is not None:
                 log.append('視点を記録できません（C_world が未生成のため、座標変換できません）。')
@@ -1336,7 +1426,7 @@ class Tab2Widget(QWidget):
                 log.append('記録された視点がありません。先に「視点を記録」してください。')
             return
         in_world = getattr(widget, 'display_in_world_frame', False)
-        c_world = None if in_world else getattr(widget, 'c_world', None)
+        c_world = None if in_world else self._effective_c_world_for_widget(widget)
         if not in_world and c_world is None:
             if log is not None:
                 log.append('視点を復元できません（C_world が未生成のため、座標変換できません）。')
@@ -1359,6 +1449,67 @@ class Tab2Widget(QWidget):
                 log.append('記録された視点に戻しました。')
         except Exception:
             pass
+
+    def _base_T_world(self):
+        """base STL 座標 → C_world 座標 の 4x4（ALL VIEW の C_world から）。未生成なら None。"""
+        base = getattr(self, 'all_view_widget', None)
+        cw = getattr(base, 'c_world', None) if base is not None else None
+        if cw is None:
+            return None
+        R_w = np.column_stack([cw['ex'], cw['ey'], cw['ez']])
+        O_w = np.asarray(cw['origin'], dtype=float)
+        R_w_T = R_w.T
+        T = np.eye(4)
+        T[:3, :3] = R_w_T
+        T[:3, 3] = -R_w_T @ O_w
+        return T
+
+    def _posture_stl_to_world(self, widget):
+        """新方式 posture: STL 座標 → C_world 座標 の 4x4。
+        = base_T_world @ T_fit。base C_world か fit が無ければ None。"""
+        base_T = self._base_T_world()
+        if base_T is None:
+            return None
+        T_fit = getattr(widget, 'fit_transform', None)
+        if T_fit is None:
+            return None
+        return base_T @ np.asarray(T_fit, dtype=float)
+
+    @staticmethod
+    def _c_world_from_T_stl_to_world(T):
+        """STL→World 変換 (4x4) から、カメラ変換用の c_world 風 dict を作る。
+        既存の _display_to_world_cam は p_world = R_w^T (p_stl - O_w) を使うので、
+        R_sw = R_w^T, t_sw = -R_w^T O_w を満たす ex/ey/ez/origin を逆算する。"""
+        T = np.asarray(T, dtype=float)
+        R_sw = T[:3, :3]
+        t_sw = T[:3, 3]
+        R_w = R_sw.T  # 列が C_world 各軸（STL 座標表現）
+        O_w = -R_sw.T @ t_sw
+        return {
+            'ex': R_w[:, 0].copy(),
+            'ey': R_w[:, 1].copy(),
+            'ez': R_w[:, 2].copy(),
+            'origin': O_w.copy(),
+        }
+
+    def _effective_c_world_for_widget(self, widget):
+        """カメラ共有用に、このウィジェットの「C_world を STL 座標で表した dict」を返す。
+        - world 系で描画するウィジェット（motion 等）→ None（変換不要）
+        - 新方式 posture → base_T_world @ T_fit から逆算
+        - それ以外（ALL VIEW / 旧方式 posture）→ widget.c_world をそのまま
+        """
+        if getattr(widget, 'display_in_world_frame', False):
+            return None
+        # ALL VIEW ミラーは本体 ALL VIEW の C_world をそのまま使う
+        if getattr(widget, 'view_kind', None) == 'all_view_mirror':
+            base = getattr(self, 'all_view_widget', None)
+            return getattr(base, 'c_world', None) if base is not None else None
+        if getattr(widget, 'use_base_fit', False) and getattr(widget, 'view_kind', None) == 'posture':
+            T = self._posture_stl_to_world(widget)
+            if T is None:
+                return None
+            return self._c_world_from_T_stl_to_world(T)
+        return getattr(widget, 'c_world', None)
 
     def _display_to_world_cam(self, position, focal, view_up, c_world):
         pos = np.asarray(position, dtype=float)
@@ -1394,7 +1545,7 @@ class Tab2Widget(QWidget):
         if plotter is None or not HAS_PYVISTA:
             return
         in_world = getattr(widget, 'display_in_world_frame', False)
-        c_world = None if in_world else getattr(widget, 'c_world', None)
+        c_world = None if in_world else self._effective_c_world_for_widget(widget)
         if not in_world and c_world is None:
             return  # 変換に C_world が要るが未生成
         try:
@@ -1415,16 +1566,15 @@ class Tab2Widget(QWidget):
         }
         self._save_shared_camera_cache()
 
-    def _set_camera_from_shared(self, widget):
-        """shared_camera_world をこのウィジェットの表示座標へ変換して適用。
-        render() は呼ばない。成功すれば True。"""
+    def _apply_shared_camera_to_plotter(self, plotter, widget):
+        """shared_camera_world を、widget の座標系を介して指定 plotter に適用。
+        plotter は widget.plotter とは別でもよい（ミラー用）。成功すれば True。"""
         if self.shared_camera_world is None:
             return False
-        plotter = getattr(widget, 'plotter', None)
         if plotter is None or not HAS_PYVISTA:
             return False
         in_world = getattr(widget, 'display_in_world_frame', False)
-        c_world = None if in_world else getattr(widget, 'c_world', None)
+        c_world = None if in_world else self._effective_c_world_for_widget(widget)
         if not in_world and c_world is None:
             return False
         try:
@@ -1441,6 +1591,11 @@ class Tab2Widget(QWidget):
         except Exception:
             return False
 
+    def _set_camera_from_shared(self, widget):
+        """shared_camera_world をこのウィジェットの表示座標へ変換して適用。
+        render() は呼ばない。成功すれば True。"""
+        return self._apply_shared_camera_to_plotter(getattr(widget, 'plotter', None), widget)
+
     def _apply_shared_camera_with_render(self, widget):
         if self._set_camera_from_shared(widget):
             try:
@@ -1454,12 +1609,12 @@ class Tab2Widget(QWidget):
             return None
         subtabs = ad['subtabs']
         idx = subtabs.currentIndex()
-        posture_labels = list(type(self).POSTURE_LABELS)
-        if 0 <= idx < len(posture_labels):
-            return ad['posture_widgets'].get(posture_labels[idx])
-        if idx == len(posture_labels):
-            return ad.get('motion_widget')
-        return None
+        # サブタブ順は [ALL VIEW ミラー, 姿勢1..5, motion]。
+        # 並びに依存せず、現在表示中のサブタブ widget をそのまま返す。
+        try:
+            return subtabs.widget(idx)
+        except Exception:
+            return None
 
     def _on_axis_subtab_changed(self, axis_letter):
         widget = self._active_widget_in_axis(axis_letter)
@@ -1719,8 +1874,12 @@ class Tab2Widget(QWidget):
         else:
             widget.check_label.setText('<br>'.join(html_lines))
 
-    def _render_all_view(self, widget, reset_view: bool = False):
-        plotter = getattr(widget, 'plotter', None)
+    def _render_all_view(self, widget, reset_view: bool = False,
+                         render_plotter=None, interactive: bool = True,
+                         force_shared_camera: bool = False):
+        """ALL VIEW の描画。render_plotter を渡すとミラー用に別 plotter へ描画する
+        （データは widget=ALL VIEW 本体から読む）。"""
+        plotter = render_plotter if render_plotter is not None else getattr(widget, 'plotter', None)
         if plotter is None or widget.current_mesh is None:
             return
 
@@ -1741,7 +1900,7 @@ class Tab2Widget(QWidget):
         plotter.set_background(bg, top=self._background_top_color(bg))
         b = widget.current_mesh.bounds
         diag = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]])) or 100.0
-        self._configure_lights(plotter, widget.c_world, diag if widget.c_world is not None else None)
+        self._configure_lights_for_widget(widget, plotter=plotter)
         plotter.hide_axes()
 
         plotter.add_mesh(
@@ -1926,9 +2085,16 @@ class Tab2Widget(QWidget):
                 except Exception:
                     pass
 
-        if reset_view:
+        if force_shared_camera:
+            # ミラー: 常に共有視点に追従（取れない場合は bounds フィット）
+            if not self._apply_shared_camera_to_plotter(plotter, widget):
+                try:
+                    plotter.reset_camera(bounds=widget.current_mesh.bounds)
+                except Exception:
+                    pass
+        elif reset_view:
             bounds = widget.current_mesh.bounds
-            if not self._set_camera_from_shared(widget):
+            if not self._apply_shared_camera_to_plotter(plotter, widget):
                 plotter.reset_camera(bounds=bounds)
         elif camera_position is not None:
             try:
@@ -1936,7 +2102,7 @@ class Tab2Widget(QWidget):
             except Exception:
                 pass
 
-        if active_plane is not None and active_plane.point_add_enabled:
+        if interactive and active_plane is not None and active_plane.point_add_enabled:
             try:
                 plotter.enable_surface_point_picking(
                     callback=lambda point, *_args: self._on_plane_surface_point_picked(active_plane, point),
@@ -1945,11 +2111,73 @@ class Tab2Widget(QWidget):
             except Exception:
                 pass
 
-        for pw in widget.plane_widgets:
-            if hasattr(pw, 'point_add_btn'):
-                pw.point_add_btn.setEnabled(pw.current_mesh is not None)
+        if interactive:
+            for pw in widget.plane_widgets:
+                if hasattr(pw, 'point_add_btn'):
+                    pw.point_add_btn.setEnabled(pw.current_mesh is not None)
 
         plotter.render()
+
+        # 本体 ALL VIEW を描画したら、各軸タブのミラーも同期再描画
+        if render_plotter is None:
+            self._sync_all_view_mirrors()
+
+    def _render_all_view_mirror(self, mirror):
+        """ALL VIEW ミラーを本体と同じ内容で再描画する。"""
+        src = getattr(self, 'all_view_widget', None)
+        plotter = getattr(mirror, 'plotter', None)
+        if plotter is None or not HAS_PYVISTA:
+            return
+        if src is None or getattr(src, 'current_mesh', None) is None:
+            self._reset_plotter_placeholder(plotter, 'ALL VIEW と同期（base STL 未読込）')
+            return
+        self._render_all_view(
+            src, reset_view=False, render_plotter=plotter,
+            interactive=False, force_shared_camera=True,
+        )
+
+    def _sync_all_view_mirrors(self):
+        for mirror in list(getattr(self, 'all_view_mirrors', []) or []):
+            try:
+                self._render_all_view_mirror(mirror)
+            except Exception:
+                pass
+
+    def _create_all_view_mirror_widget(self) -> QWidget:
+        """各軸タブの先頭に置く、ALL VIEW と完全同期する表示専用ミラー。"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(2, 2, 2, 2)
+
+        info = QLabel('ALL VIEW（ミラー：本体 ALL VIEW と同期表示）')
+        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info.setStyleSheet('font-weight: bold; font-size: 11px; color: #bfe4ff;')
+        layout.addWidget(info)
+
+        if HAS_PYVISTA:
+            plotter = QtInteractor(widget)
+            self._setup_plotter_jp_fonts(plotter)
+            bg, _ = self._load_visual_settings()
+            plotter.set_background(bg, top=self._background_top_color(bg))
+            plotter.add_text('ALL VIEW と同期表示', position='upper_left', font_size=10)
+            self._configure_lights(plotter)
+            view = plotter.interactor
+        else:
+            plotter = None
+            view = QLabel('pyvista / pyvistaqt が未インストール')
+            view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        widget.plotter = plotter
+        widget.view_kind = 'all_view_mirror'
+        widget.display_in_world_frame = False
+        self._attach_camera_observer(widget)
+        layout.addWidget(view, 1)
+
+        self.visual_widgets.append(widget)
+        if not hasattr(self, 'all_view_mirrors'):
+            self.all_view_mirrors = []
+        self.all_view_mirrors.append(widget)
+        return widget
 
     def _create_axis_tab(self, axis_letter: str, joint_type: str = 'rotation') -> QWidget:
         """U/V/W/X/Y/Z 軸の共通タブ作成。
@@ -1967,6 +2195,12 @@ class Tab2Widget(QWidget):
         posture_subtabs = QTabWidget()
         postures = list(type(self).POSTURE_SPECS)
         posture_widgets = {}
+
+        # 姿勢1 の左に ALL VIEW のミラー（本体と同期）を配置（FE タブには base が無いので作らない）
+        mirror_widget = None
+        if not getattr(self, 'fe_mode', False):
+            mirror_widget = self._create_all_view_mirror_widget()
+            posture_subtabs.addTab(mirror_widget, 'ALL VIEW')
 
         for posture_label, example_text, posture_key in postures:
             posture_widget = self._create_posture_view_widget(
@@ -1989,6 +2223,7 @@ class Tab2Widget(QWidget):
             'subtabs': posture_subtabs,
             'posture_widgets': posture_widgets,
             'motion_widget': motion_widget,
+            'mirror_widget': mirror_widget,
             'joint_type': joint_type,
         }
 
@@ -2618,7 +2853,7 @@ class Tab2Widget(QWidget):
         plotter.clear()
         background_color, model_color = self._load_visual_settings()
         plotter.set_background(background_color, top=self._background_top_color(background_color))
-        self._configure_lights(plotter)
+        self._configure_lights_for_widget(widget, plotter=plotter)
         plotter.hide_axes()
 
         rot = getattr(widget, 'motion_axis', None)
@@ -3823,7 +4058,7 @@ class Tab2Widget(QWidget):
         plotter.set_background(background_color, top=self._background_top_color(background_color))
         b = posture_widget.current_mesh.bounds
         diag = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]])) or 100.0
-        self._configure_lights(plotter, posture_widget.c_world, diag if posture_widget.c_world is not None else None)
+        self._configure_lights_for_widget(posture_widget, plotter=plotter)
         plotter.add_mesh(
             posture_widget.current_mesh,
             name='stl_model',
@@ -4639,6 +4874,14 @@ class Tab2Widget(QWidget):
         widget.fit_btn.setEnabled(True)
         self._save_posture_cache(widget)
         self._invalidate_motion_for_posture(widget)
+        # フィッティング完了で STL↔C_world が結びついたので、照明・視点を同期反映
+        if getattr(widget, 'current_mesh', None) is not None:
+            try:
+                self._render_posture1_plotter(widget, reset_view=False)
+            except Exception:
+                pass
+        if self.shared_camera_world is not None:
+            self._apply_shared_camera_with_render(widget)
         self._show_fit_result(widget)
 
     def _on_fit_error(self, widget, msg):
