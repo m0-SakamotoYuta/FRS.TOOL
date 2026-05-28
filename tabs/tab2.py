@@ -15,6 +15,12 @@ try:
 except Exception:
     HAS_PYVISTA = False
 
+try:
+    import open3d as o3d
+    HAS_OPEN3D = True
+except Exception:
+    HAS_OPEN3D = False
+
 from tabs.settings import (
     load_settings,
     save_settings,
@@ -110,6 +116,117 @@ class STLLoadWorker(QObject):
             self.error.emit(f'STL読み込み失敗: {e}')
 
 
+# ===== RANSAC → ICP フィッティング（open3d）=====
+
+def _mesh_to_o3d_pcd(mesh, voxel_size):
+    """pyvista mesh → ダウンサンプリング済み open3d PointCloud（法線付き）と FPFH 特徴量。"""
+    pts = np.asarray(mesh.points, dtype=np.float64)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    pcd_down = pcd.voxel_down_sample(voxel_size) if voxel_size > 0 else pcd
+    pcd_down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2.0, max_nn=30)
+    )
+    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5.0, max_nn=100),
+    )
+    return pcd_down, fpfh
+
+
+def _default_voxel_size(mesh):
+    """メッシュの対角長から妥当な voxel サイズ（mm）を推定する。"""
+    try:
+        b = mesh.bounds
+        diag = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]]))
+    except Exception:
+        diag = 100.0
+    return max(diag * 0.02, 1e-3)
+
+
+def ransac_icp_fit(source_mesh, target_mesh, params, log=None):
+    """source（姿勢の任意領域）を target（base の任意領域）へ剛体フィッティングする。
+
+    返り値 dict:
+        transform: 4x4 (source 座標 → target 座標)
+        ransac_fitness, ransac_rmse, icp_fitness, icp_rmse, voxel_size
+    """
+    def _log(msg):
+        if callable(log):
+            log(msg)
+
+    voxel_size = float(params.get('voxel_size', 0.0) or 0.0)
+    if voxel_size <= 0:
+        voxel_size = _default_voxel_size(target_mesh)
+        _log(f'voxel サイズを自動推定: {voxel_size:.4f} mm')
+
+    ransac_iter = int(params.get('ransac_iter', 100000))
+    icp_iter = int(params.get('icp_iter', 50))
+    dist_factor = float(params.get('dist_factor', 1.5))
+
+    _log('点群を準備中（ダウンサンプリング + FPFH 特徴量）...')
+    src_down, src_fpfh = _mesh_to_o3d_pcd(source_mesh, voxel_size)
+    tgt_down, tgt_fpfh = _mesh_to_o3d_pcd(target_mesh, voxel_size)
+
+    distance_threshold = voxel_size * dist_factor
+    _log(f'RANSAC グローバル位置合わせ中（反復上限 {ransac_iter}, 閾値 {distance_threshold:.4f} mm）...')
+    ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        src_down, tgt_down, src_fpfh, tgt_fpfh, True,
+        distance_threshold,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        3,
+        [
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold),
+        ],
+        o3d.pipelines.registration.RANSACConvergenceCriteria(ransac_iter, 0.999),
+    )
+    _log(f'  RANSAC: fitness={ransac.fitness:.4f}, inlier_rmse={ransac.inlier_rmse:.4f} mm')
+
+    icp_threshold = voxel_size * 0.8
+    _log(f'ICP 微調整中（反復上限 {icp_iter}, 閾値 {icp_threshold:.4f} mm）...')
+    icp = o3d.pipelines.registration.registration_icp(
+        src_down, tgt_down, icp_threshold, ransac.transformation,
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=icp_iter),
+    )
+    _log(f'  ICP: fitness={icp.fitness:.4f}, inlier_rmse={icp.inlier_rmse:.4f} mm')
+
+    return {
+        'transform': np.asarray(icp.transformation, dtype=float).copy(),
+        'ransac_fitness': float(ransac.fitness),
+        'ransac_rmse': float(ransac.inlier_rmse),
+        'icp_fitness': float(icp.fitness),
+        'icp_rmse': float(icp.inlier_rmse),
+        'voxel_size': voxel_size,
+    }
+
+
+class FitWorker(QObject):
+    """RANSAC→ICP フィッティング用ワーカースレッド"""
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)
+
+    def __init__(self, source_mesh, target_mesh, params):
+        super().__init__()
+        self.source_mesh = source_mesh
+        self.target_mesh = target_mesh
+        self.params = params
+
+    def run(self):
+        if not HAS_OPEN3D:
+            self.error.emit('open3d が見つかりません。`pip install open3d` を実行してください。')
+            return
+        try:
+            result = ransac_icp_fit(
+                self.source_mesh, self.target_mesh, self.params, log=self.log.emit
+            )
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(f'フィッティング失敗: {e}')
+
+
 class Tab2Widget(QWidget):
     # サブクラス（FEAxisWidget 等）で別の設定キーへ切り替えるためのデフォルト
     SETTINGS_TOP_KEY = 'tab2'
@@ -168,6 +285,16 @@ class Tab2Widget(QWidget):
 
         layout.addWidget(self.top_subtabs)
         self.setLayout(layout)
+
+    # 新方式（base STL への RANSAC→ICP フィッティングで重ね合わせ）を使う軸。
+    # 動作確認後に 'v','w' 等へ拡張する。FE タブ（base 無し）は常に旧方式。
+    BASE_FIT_AXES = {'u'}
+
+    def _uses_base_fitting(self, axis_letter) -> bool:
+        """指定の軸が新方式（base へのフィッティング）を使うか。"""
+        if getattr(self, 'fe_mode', False):
+            return False
+        return axis_letter in type(self).BASE_FIT_AXES
 
     def _load_visual_settings(self):
         settings = load_settings() or {}
@@ -461,6 +588,17 @@ class Tab2Widget(QWidget):
         clear_stl_btn = QPushButton('読み込んだSTLを消去')
         clear_stl_btn.setEnabled(False)
         left_layout.addWidget(clear_stl_btn)
+
+        # === 任意領域 STL（フィッティングの target）===
+        widget.region_mesh = None
+        widget.region_stl_path = None
+        load_region_btn = QPushButton('任意領域のSTLを読み込む')
+        clear_region_btn = QPushButton('任意領域のSTLを消去')
+        clear_region_btn.setEnabled(False)
+        widget.load_region_btn = load_region_btn
+        widget.clear_region_btn = clear_region_btn
+        left_layout.addWidget(load_region_btn)
+        left_layout.addWidget(clear_region_btn)
 
         self._add_lighting_toggle(left_layout, widget)
 
@@ -785,6 +923,8 @@ class Tab2Widget(QWidget):
         # === ボタン接続 ===
         load_btn.clicked.connect(lambda: self._open_posture_file(widget))
         clear_stl_btn.clicked.connect(lambda: self._clear_all_view_stl(widget))
+        load_region_btn.clicked.connect(lambda: self._open_region_file(widget))
+        clear_region_btn.clicked.connect(lambda: self._clear_region_stl(widget))
         build_world_btn.clicked.connect(lambda: self._build_c_world_for_all_view(widget))
         clear_world_btn.clicked.connect(lambda: self._clear_c_world_for_all_view(widget))
         import_rotation_btn.clicked.connect(lambda: self._import_axes(widget, kind='rotation'))
@@ -815,6 +955,15 @@ class Tab2Widget(QWidget):
             widget._start_load(cached_stl_path, preserve_state=True)
         elif cached_stl_path:
             widget.log_view.append(f'前回のSTLが見つかりません: {cached_stl_path}')
+
+        # 任意領域 STL のキャッシュを復元
+        region_path = getattr(widget, 'region_stl_path', None)
+        if region_path and os.path.exists(region_path):
+            widget.log_view.append(f'任意領域キャッシュ検出: {region_path}')
+            self._load_region_stl(widget, region_path, from_cache=True)
+        elif region_path:
+            widget.log_view.append(f'前回の任意領域STLが見つかりません: {region_path}')
+            widget.region_stl_path = None
 
         return widget
 
@@ -996,15 +1145,22 @@ class Tab2Widget(QWidget):
 
     # ----- motion-axis (回転軸/並進軸) のキャッシュ -----
     def _capture_motion_source_state(self, posture_widgets):
-        """motion-axis のソースとなる c_axis/c_world のスナップショット。"""
-        state = []
+        """motion-axis のソースとなる c_axis/c_world/fit のスナップショット。"""
+        # base の C_world も新方式ではソースの一部
+        base_cw = None
+        base_widget = getattr(self, 'all_view_widget', None)
+        if base_widget is not None:
+            base_cw = self._serialize_frame(getattr(base_widget, 'c_world', None))
+        state = [{'base_c_world': base_cw}]
         for p in type(self).POSTURE_LABELS:
             pw = posture_widgets.get(p) if posture_widgets else None
             ca = getattr(pw, 'c_axis', None) if pw else None
             cw = getattr(pw, 'c_world', None) if pw else None
+            ft = getattr(pw, 'fit_transform', None) if pw else None
             state.append({
                 'c_axis': self._serialize_frame(ca),
                 'c_world': self._serialize_frame(cw),
+                'fit_transform': (np.asarray(ft, dtype=float).tolist() if ft is not None else None),
             })
         return state
 
@@ -1012,12 +1168,16 @@ class Tab2Widget(QWidget):
         if mot is None:
             return None
         try:
+            base_T = mot.get('base_T_world')
             return {
                 'direction': [float(v) for v in mot['direction']],
                 'point': [float(v) for v in mot['point']],
                 'R_local_world': [np.asarray(m, dtype=float).tolist() for m in mot['R_local_world']],
                 'O_local_world': [np.asarray(o, dtype=float).tolist() for o in mot['O_local_world']],
                 'T_stl_to_world': [np.asarray(t, dtype=float).tolist() for t in mot['T_stl_to_world']],
+                'use_base_fit': bool(mot.get('use_base_fit', False)),
+                'base_T_world': (np.asarray(base_T, dtype=float).tolist() if base_T is not None else None),
+                'valid_postures': list(mot.get('valid_postures') or []),
             }
         except Exception:
             return None
@@ -1026,12 +1186,16 @@ class Tab2Widget(QWidget):
         if not isinstance(d, dict):
             return None
         try:
+            base_T = d.get('base_T_world')
             return {
                 'direction': np.array(d['direction'], dtype=float),
                 'point': np.array(d['point'], dtype=float),
                 'R_local_world': [np.array(m, dtype=float) for m in d['R_local_world']],
                 'O_local_world': [np.array(o, dtype=float) for o in d['O_local_world']],
                 'T_stl_to_world': [np.array(t, dtype=float) for t in d['T_stl_to_world']],
+                'use_base_fit': bool(d.get('use_base_fit', False)),
+                'base_T_world': (np.array(base_T, dtype=float) if base_T is not None else None),
+                'valid_postures': list(d.get('valid_postures') or []),
             }
         except Exception:
             return None
@@ -2002,6 +2166,8 @@ class Tab2Widget(QWidget):
         widget.stl_visibility = {lbl: True for lbl in _posture_labels}
         widget.caxis_visibility = {lbl: True for lbl in _posture_labels}
         widget.show_cworld = True
+        widget.show_base_stl = True
+        widget.base_stl_opacity = 0.35
 
         if enable_posture_controls:
             posture_view_group = QGroupBox('姿勢変化を分かりやすくする')
@@ -2014,6 +2180,16 @@ class Tab2Widget(QWidget):
             cworld_cb = QCheckBox('C_world を表示')
             cworld_cb.setChecked(True)
             pv_layout.addWidget(cworld_cb)
+
+            # 新方式のみ: base STL の表示トグル
+            if self._uses_base_fitting(axis_letter):
+                base_stl_cb = QCheckBox('STL(base) を表示')
+                base_stl_cb.setChecked(True)
+                pv_layout.addWidget(base_stl_cb)
+                widget.base_stl_cb = base_stl_cb
+                base_stl_cb.toggled.connect(
+                    lambda c, w=widget: self._on_posture_view_toggled(w, 'base_stl', None, c)
+                )
 
             stl_cbs = {}
             caxis_cbs = {}
@@ -2119,6 +2295,8 @@ class Tab2Widget(QWidget):
             widget.unify_stl_color = bool(checked)
         elif kind == 'cworld':
             widget.show_cworld = bool(checked)
+        elif kind == 'base_stl':
+            widget.show_base_stl = bool(checked)
         elif kind == 'stl':
             if not hasattr(widget, 'stl_visibility'):
                 widget.stl_visibility = {}
@@ -2183,8 +2361,24 @@ class Tab2Widget(QWidget):
         local_prefix = f'C_{axis_letter}-axis'
         posture_widgets = getattr(widget, 'posture_widgets', {})
         all_postures = list(type(self).POSTURE_LABELS)
+        use_base_fit = self._uses_base_fitting(axis_letter)
 
-        # 寛容な入力検証: 有効な姿勢（c_axis / c_world / STL のすべてが揃ったもの）を抽出
+        # base 情報（新方式のみ）: 単一の C_world は ALL VIEW(base) で生成したもの
+        base_widget = getattr(self, 'all_view_widget', None)
+        base_T_world = None      # base STL 座標 → C_world 座標 の 4x4
+        if use_base_fit:
+            if base_widget is None or getattr(base_widget, 'c_world', None) is None:
+                log.append('ALL VIEW で C_world 座標系が未生成です。先に base STL の C_world を生成してください。')
+                return
+            cw = base_widget.c_world
+            R_w = np.column_stack([cw['ex'], cw['ey'], cw['ez']])
+            O_w = np.asarray(cw['origin'], dtype=float)
+            R_w_T = R_w.T
+            base_T_world = np.eye(4)
+            base_T_world[:3, :3] = R_w_T
+            base_T_world[:3, 3] = -R_w_T @ O_w
+
+        # 寛容な入力検証: 有効な姿勢を抽出
         valid = []  # list of (posture_label, posture_widget)
         for p in all_postures:
             pw = posture_widgets.get(p)
@@ -2193,16 +2387,24 @@ class Tab2Widget(QWidget):
             if getattr(pw, 'c_axis', None) is None:
                 log.append(f'{p}: {local_prefix} 未生成のためスキップ')
                 continue
-            if getattr(pw, 'c_world', None) is None:
-                log.append(f'{p}: C_world 未生成のためスキップ')
-                continue
             if getattr(pw, 'current_mesh', None) is None:
                 log.append(f'{p}: STL 未読込のためスキップ')
                 continue
+            if use_base_fit:
+                if getattr(pw, 'fit_transform', None) is None:
+                    log.append(f'{p}: base へのフィッティング未実施のためスキップ')
+                    continue
+            else:
+                if getattr(pw, 'c_world', None) is None:
+                    log.append(f'{p}: C_world 未生成のためスキップ')
+                    continue
             valid.append((p, pw))
 
         if len(valid) < 2:
-            log.append('有効な姿勢が 2 つ以上ありません。各姿勢で STL 読込・C_local・C_world をご準備ください。')
+            if use_base_fit:
+                log.append('有効な姿勢が 2 つ以上ありません。各姿勢で STL 読込・C_local 生成・base へのフィッティングをご準備ください。')
+            else:
+                log.append('有効な姿勢が 2 つ以上ありません。各姿勢で STL 読込・C_local・C_world をご準備ください。')
             return
 
         log.append(f'有効な姿勢: {", ".join(p for p, _ in valid)} （計 {len(valid)} 個）')
@@ -2211,18 +2413,35 @@ class Tab2Widget(QWidget):
         R_local_world = []
         O_local_world = []
         T_stl_to_world = []
-        for _p, pw in valid:
-            R_loc = np.column_stack([pw.c_axis['ex'], pw.c_axis['ey'], pw.c_axis['ez']])
-            O_loc = np.asarray(pw.c_axis['origin'], dtype=float)
-            R_w = np.column_stack([pw.c_world['ex'], pw.c_world['ey'], pw.c_world['ez']])
-            O_w = np.asarray(pw.c_world['origin'], dtype=float)
-            R_w_T = R_w.T
-            R_local_world.append(R_w_T @ R_loc)
-            O_local_world.append(R_w_T @ (O_loc - O_w))
-            T = np.eye(4)
-            T[:3, :3] = R_w_T
-            T[:3, 3] = -R_w_T @ O_w
-            T_stl_to_world.append(T)
+        if use_base_fit:
+            # 新方式: posture STL --T_fit--> base STL --base_T_world--> C_world
+            R_bw = base_T_world[:3, :3]
+            t_bw = base_T_world[:3, 3]
+            for _p, pw in valid:
+                R_loc = np.column_stack([pw.c_axis['ex'], pw.c_axis['ey'], pw.c_axis['ez']])
+                O_loc = np.asarray(pw.c_axis['origin'], dtype=float)
+                T_fit = np.asarray(pw.fit_transform, dtype=float)
+                R_fit = T_fit[:3, :3]
+                t_fit = T_fit[:3, 3]
+                # C_local を C_world 表現へ
+                R_local_world.append(R_bw @ R_fit @ R_loc)
+                O_local_world.append(R_bw @ (R_fit @ O_loc + t_fit) + t_bw)
+                # STL→World = base_T_world @ T_fit
+                T_stl_to_world.append(base_T_world @ T_fit)
+        else:
+            # 旧方式: 各姿勢が自前の C_world を持つ
+            for _p, pw in valid:
+                R_loc = np.column_stack([pw.c_axis['ex'], pw.c_axis['ey'], pw.c_axis['ez']])
+                O_loc = np.asarray(pw.c_axis['origin'], dtype=float)
+                R_w = np.column_stack([pw.c_world['ex'], pw.c_world['ey'], pw.c_world['ez']])
+                O_w = np.asarray(pw.c_world['origin'], dtype=float)
+                R_w_T = R_w.T
+                R_local_world.append(R_w_T @ R_loc)
+                O_local_world.append(R_w_T @ (O_loc - O_w))
+                T = np.eye(4)
+                T[:3, :3] = R_w_T
+                T[:3, 3] = -R_w_T @ O_w
+                T_stl_to_world.append(T)
 
         N = len(valid)
         pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
@@ -2294,6 +2513,8 @@ class Tab2Widget(QWidget):
                 'O_local_world': O_local_world,
                 'T_stl_to_world': T_stl_to_world,
                 'valid_postures': [p for p, _ in valid],
+                'use_base_fit': use_base_fit,
+                'base_T_world': base_T_world,
             }
 
             log.append(f'{motion_name} を計算しました（C_world 座標系上, {N} 姿勢, {len(pairs)} ペア）:')
@@ -2344,6 +2565,8 @@ class Tab2Widget(QWidget):
                 'O_local_world': O_local_world,
                 'T_stl_to_world': T_stl_to_world,
                 'valid_postures': [p for p, _ in valid],
+                'use_base_fit': use_base_fit,
+                'base_T_world': base_T_world,
             }
 
             log.append(f'{motion_name} を計算しました（C_world 座標系上, {N} 姿勢, {len(pairs)} ペア）:')
@@ -2472,6 +2695,25 @@ class Tab2Widget(QWidget):
                 min(bnds[2], b[2]), max(bnds[3], b[3]),
                 min(bnds[4], b[4]), max(bnds[5], b[5]),
             ]
+
+        # 新方式: base STL を C_world 上に重ねて表示（全姿勢が揃う基準）
+        if rot.get('use_base_fit') and rot.get('base_T_world') is not None:
+            base_widget = getattr(self, 'all_view_widget', None)
+            base_mesh = getattr(base_widget, 'current_mesh', None) if base_widget else None
+            if base_mesh is not None and getattr(widget, 'show_base_stl', True):
+                try:
+                    bm = base_mesh.copy()
+                    bm.transform(np.asarray(rot['base_T_world'], dtype=float), inplace=True)
+                    bounds_all = _accumulate_bounds(bounds_all, bm.bounds)
+                    plotter.add_mesh(
+                        bm, name='rot_stl_base', color='#c0c4cc',
+                        opacity=float(getattr(widget, 'base_stl_opacity', 0.35)),
+                        show_edges=False, smooth_shading=True,
+                        ambient=0.15, diffuse=0.75, specular=0.2,
+                        specular_power=20.0, pickable=False,
+                    )
+                except Exception:
+                    pass
 
         for p, T in zip(postures, T_list):
             pw = posture_widgets[p]
@@ -2683,6 +2925,9 @@ class Tab2Widget(QWidget):
         widget = DnDWidget()
         widget.posture_key = posture_key
         widget.axis_letter = axis_letter
+        # 新方式（base へのフィッティングで重ね合わせ）を使うか
+        use_base_fit = self._uses_base_fitting(axis_letter)
+        widget.use_base_fit = use_base_fit
         # 例: 'C_u-axis_posi1', 'C_v-axis_posi1', 'C_w-axis_posi1'
         widget.c_axis_name = f'C_{axis_letter}-axis_{posture_key.replace("posture", "posi")}'
         widget.c_axis_label_prefix = f'C_{axis_letter}-axis'  # 例 'C_u-axis'
@@ -2707,6 +2952,70 @@ class Tab2Widget(QWidget):
         clear_stl_btn = QPushButton('読み込んだSTLを消去')
         clear_stl_btn.setEnabled(False)
         left_layout.addWidget(clear_stl_btn)
+
+        # === 任意領域 STL の読み込み + base へのフィッティング（新方式: U軸のみ）===
+        widget.region_mesh = None
+        widget.region_stl_path = None
+        widget.fit_transform = None      # 4x4 (この姿勢の STL 座標 → base STL 座標)
+        widget.fit_result = None         # フィッティング統計
+        load_region_btn = QPushButton('任意領域のSTLを読み込む')
+        fit_btn = QPushButton('任意領域をSTL(base)の任意領域にフィッティング')
+        fit_check_btn = QPushButton('フィッティング結果の確認')
+        widget.load_region_btn = load_region_btn
+        widget.fit_btn = fit_btn
+        widget.fit_check_btn = fit_check_btn
+        if use_base_fit:
+            left_layout.addWidget(load_region_btn)
+            clear_region_btn = QPushButton('任意領域のSTLを消去')
+            clear_region_btn.setEnabled(False)
+            widget.clear_region_btn = clear_region_btn
+            left_layout.addWidget(clear_region_btn)
+
+            fit_group = QGroupBox('base へのフィッティング (RANSAC → ICP)')
+            fit_layout = QVBoxLayout(fit_group)
+
+            def _make_param_row(label_text, lo, hi, default, decimals=0, suffix=''):
+                row = QHBoxLayout()
+                lbl = QLabel(label_text)
+                lbl.setMinimumWidth(110)
+                if decimals > 0:
+                    from PyQt6.QtWidgets import QDoubleSpinBox
+                    spin = QDoubleSpinBox()
+                    spin.setDecimals(decimals)
+                else:
+                    spin = QSpinBox()
+                spin.setRange(lo, hi)
+                spin.setValue(default)
+                if suffix:
+                    spin.setSuffix(suffix)
+                row.addWidget(lbl)
+                row.addWidget(spin, 1)
+                fit_layout.addLayout(row)
+                return spin
+
+            # voxel=0 → 自動推定
+            voxel_spin = _make_param_row('voxel サイズ:', 0.0, 1000.0, 0.0, decimals=3, suffix=' mm')
+            voxel_spin.setToolTip('0 にすると base の対角長から自動推定します。')
+            ransac_iter_spin = _make_param_row('RANSAC 反復:', 1000, 10000000, 100000)
+            icp_iter_spin = _make_param_row('ICP 反復:', 1, 2000, 50)
+            dist_spin = _make_param_row('距離係数(×voxel):', 0.1, 50.0, 1.5, decimals=2)
+            widget.fit_voxel_spin = voxel_spin
+            widget.fit_ransac_iter_spin = ransac_iter_spin
+            widget.fit_icp_iter_spin = icp_iter_spin
+            widget.fit_dist_spin = dist_spin
+
+            fit_btn.setEnabled(False)
+            fit_check_btn.setEnabled(False)
+            fit_layout.addWidget(fit_btn)
+            fit_layout.addWidget(fit_check_btn)
+
+            fit_status = QLabel('未フィッティング')
+            fit_status.setWordWrap(True)
+            fit_status.setStyleSheet('color: #cfa; font-size: 11px;')
+            widget.fit_status_label = fit_status
+            fit_layout.addWidget(fit_status)
+
+            left_layout.addWidget(fit_group)
 
         self._add_lighting_toggle(left_layout, widget)
 
@@ -2888,13 +3197,17 @@ class Tab2Widget(QWidget):
             widget.origin_size_slider = origin_size_slider
             widget.origin_size_spin = origin_size_spin
 
+        # C_world 生成/消去（旧方式: V〜Z軸 / FE のみ表示。新方式では base 側で1回だけ作る）
         build_world_btn = QPushButton('C_world 座標系を生成')
         build_world_btn.setEnabled(False)
-        left_layout.addWidget(build_world_btn)
-
         clear_world_btn = QPushButton('C_world 座標系を消去')
         clear_world_btn.setEnabled(False)
-        left_layout.addWidget(clear_world_btn)
+        if use_base_fit:
+            build_world_btn.hide()
+            clear_world_btn.hide()
+        else:
+            left_layout.addWidget(build_world_btn)
+            left_layout.addWidget(clear_world_btn)
 
         # === 視点記録ボタン ===
         view_btn_row = QHBoxLayout()
@@ -2942,10 +3255,15 @@ class Tab2Widget(QWidget):
             ('平面1（XY平面）', f'XY平面 [{cax} 用]', 'c_axis'),
             ('平面2（YZ平面）', f'YZ平面 [{cax} 用]', 'c_axis'),
             ('平面3（ZX平面）', f'ZX平面 [{cax} 用]', 'c_axis'),
-            ('W平面1（XY平面）', 'W平面1（XY平面） [C_world 用]', 'c_world'),
-            ('W平面2（YZ平面）', 'W平面2（YZ平面） [C_world 用]', 'c_world'),
-            ('W平面3（ZX平面）', 'W平面3（ZX平面） [C_world 用]', 'c_world'),
         ]
+        # 旧方式（V〜Z / FE）のみ C_world 用の W平面サブタブを持つ。
+        # 新方式（U軸）は C_world を base 側で1回だけ作るため W平面は不要。
+        if not use_base_fit:
+            plane_specs += [
+                ('W平面1（XY平面）', 'W平面1（XY平面） [C_world 用]', 'c_world'),
+                ('W平面2（YZ平面）', 'W平面2（YZ平面） [C_world 用]', 'c_world'),
+                ('W平面3（ZX平面）', 'W平面3（ZX平面） [C_world 用]', 'c_world'),
+            ]
 
         plane_widgets = []
         widget.shared_points = {}        # C_u-axis 用
@@ -3058,6 +3376,8 @@ class Tab2Widget(QWidget):
             widget.load_btn.setEnabled(True)
             widget.clear_stl_btn.setEnabled(True)
             self._save_posture_cache(widget)
+            if getattr(widget, 'use_base_fit', False):
+                self._update_fit_button_state(widget)
             # 新規 STL ロード（非 preserve）はソース変更 → motion-axis を無効化
             if not preserve:
                 self._invalidate_motion_for_posture(widget)
@@ -3075,6 +3395,12 @@ class Tab2Widget(QWidget):
         clear_axis_btn.clicked.connect(lambda: self._clear_c_axis(widget))
         build_world_btn.clicked.connect(lambda: self._build_c_world_axis(widget))
         clear_world_btn.clicked.connect(lambda: self._clear_c_world_axis(widget))
+
+        if use_base_fit:
+            load_region_btn.clicked.connect(lambda: self._open_region_file(widget))
+            widget.clear_region_btn.clicked.connect(lambda: self._clear_region_stl(widget))
+            fit_btn.clicked.connect(lambda: self._run_fit(widget))
+            fit_check_btn.clicked.connect(lambda: self._show_fit_result(widget))
 
         widget._start_load = _start_load
         widget._on_mesh_loaded = _on_mesh_loaded
@@ -3129,6 +3455,18 @@ class Tab2Widget(QWidget):
             widget._start_load(cached_stl_path, preserve_state=True)
         elif cached_stl_path:
             widget.log_view.append(f'前回のSTLが見つかりません: {cached_stl_path}')
+
+        # 任意領域 STL のキャッシュを復元（新方式のみ）
+        if use_base_fit:
+            region_path = getattr(widget, 'region_stl_path', None)
+            if region_path and os.path.exists(region_path):
+                widget.log_view.append(f'任意領域キャッシュ検出: {region_path}')
+                self._load_region_stl(widget, region_path, from_cache=True)
+            elif region_path:
+                widget.log_view.append(f'前回の任意領域STLが見つかりません: {region_path}')
+                widget.region_stl_path = None
+            self._update_fit_status_label(widget)
+            self._update_fit_button_state(widget)
 
         return widget
 
@@ -3738,6 +4076,29 @@ class Tab2Widget(QWidget):
             else:
                 posture_entry.pop('c_world', None)
 
+            # 任意領域 STL パス
+            region_path = getattr(posture_widget, 'region_stl_path', None)
+            if region_path:
+                posture_entry['region_stl_path'] = region_path
+            else:
+                posture_entry.pop('region_stl_path', None)
+
+            # base へのフィッティング変換（4x4）とその統計
+            fit_T = getattr(posture_widget, 'fit_transform', None)
+            if fit_T is not None:
+                posture_entry['fit_transform'] = np.asarray(fit_T, dtype=float).tolist()
+                fr = getattr(posture_widget, 'fit_result', None)
+                if isinstance(fr, dict):
+                    posture_entry['fit_result'] = {
+                        k: fr.get(k) for k in (
+                            'ransac_fitness', 'ransac_rmse',
+                            'icp_fitness', 'icp_rmse', 'voxel_size',
+                        )
+                    }
+            else:
+                posture_entry.pop('fit_transform', None)
+                posture_entry.pop('fit_result', None)
+
             save_settings(settings)
         except Exception:
             pass
@@ -3778,6 +4139,20 @@ class Tab2Widget(QWidget):
             posture_entry.get('c_axis') or posture_entry.get('c_u_axis')
         )
         posture_widget.c_world = self._deserialize_frame(posture_entry.get('c_world'))
+
+        # 任意領域 STL パスとフィッティング変換を復元
+        posture_widget.region_stl_path = posture_entry.get('region_stl_path') or None
+        fit_T = posture_entry.get('fit_transform')
+        if fit_T is not None:
+            try:
+                posture_widget.fit_transform = np.asarray(fit_T, dtype=float)
+                posture_widget.fit_result = posture_entry.get('fit_result') or {}
+            except Exception:
+                posture_widget.fit_transform = None
+                posture_widget.fit_result = None
+        else:
+            posture_widget.fit_transform = None
+            posture_widget.fit_result = None
 
         return str(posture_entry.get('stl_path') or '')
 
@@ -4110,6 +4485,212 @@ class Tab2Widget(QWidget):
         if not path:
             return
         widget._start_load(path)
+
+    # ===== 任意領域 STL + base へのフィッティング（新方式）=====
+
+    def _get_base_region_mesh(self):
+        """ALL VIEW(base) タブの任意領域メッシュ（フィッティングの target）。"""
+        base = getattr(self, 'all_view_widget', None)
+        if base is None:
+            return None
+        return getattr(base, 'region_mesh', None)
+
+    def _refresh_all_fit_buttons(self):
+        """全姿勢のフィッティングボタン状態を更新（base 領域の有無が変わったとき用）。"""
+        for ad in self.axis_data.values():
+            for pw in (ad.get('posture_widgets') or {}).values():
+                if getattr(pw, 'use_base_fit', False):
+                    self._update_fit_button_state(pw)
+
+    def _update_fit_button_state(self, widget):
+        if not getattr(widget, 'use_base_fit', False):
+            return
+        has_region = getattr(widget, 'region_mesh', None) is not None
+        has_base = self._get_base_region_mesh() is not None
+        if hasattr(widget, 'fit_btn'):
+            widget.fit_btn.setEnabled(bool(has_region and has_base and HAS_OPEN3D))
+        if hasattr(widget, 'fit_check_btn'):
+            widget.fit_check_btn.setEnabled(getattr(widget, 'fit_transform', None) is not None)
+        if hasattr(widget, 'clear_region_btn'):
+            widget.clear_region_btn.setEnabled(has_region)
+
+    def _update_fit_status_label(self, widget):
+        lbl = getattr(widget, 'fit_status_label', None)
+        if lbl is None:
+            return
+        if getattr(widget, 'fit_transform', None) is None:
+            lbl.setText('未フィッティング')
+            return
+        fr = getattr(widget, 'fit_result', None) or {}
+        lbl.setText(
+            'フィット済み: '
+            f"ICP fitness={fr.get('icp_fitness', float('nan')):.3f}, "
+            f"RMSE={fr.get('icp_rmse', float('nan')):.3f} mm"
+        )
+
+    def _read_region_mesh(self, path):
+        mesh = pv.read(path)
+        mesh = mesh.extract_surface(algorithm='dataset_surface').triangulate()
+        mesh = mesh.compute_normals(
+            cell_normals=False, point_normals=True,
+            consistent_normals=True, auto_orient_normals=True,
+        )
+        return mesh
+
+    def _open_region_file(self, widget):
+        path, _ = QFileDialog.getOpenFileName(widget, '任意領域STLファイルを開く', '', 'STL Files (*.stl)')
+        if not path:
+            return
+        self._load_region_stl(widget, path)
+
+    def _load_region_stl(self, widget, path, from_cache: bool = False):
+        if not HAS_PYVISTA:
+            widget.log_view.append('pyvista が無いため任意領域を読み込めません。')
+            return
+        try:
+            mesh = self._read_region_mesh(path)
+        except Exception as e:
+            widget.log_view.append(f'任意領域STL読み込み失敗: {e}')
+            return
+        widget.region_mesh = mesh
+        widget.region_stl_path = path
+        widget.log_view.append(
+            f'任意領域STLを読み込みました: {path} (points={mesh.n_points})'
+        )
+        if hasattr(widget, 'clear_region_btn'):
+            widget.clear_region_btn.setEnabled(True)
+        if not from_cache:
+            self._save_posture_cache(widget)
+        # base 側の領域が変わると全姿勢のフィッティングボタンに影響
+        if getattr(widget, 'view_kind', None) == 'all_view':
+            self._refresh_all_fit_buttons()
+        else:
+            self._update_fit_button_state(widget)
+
+    def _clear_region_stl(self, widget):
+        widget.region_mesh = None
+        widget.region_stl_path = None
+        widget.fit_transform = None
+        widget.fit_result = None
+        widget.log_view.append('任意領域STLを消去しました。フィッティング結果もクリアしました。')
+        if hasattr(widget, 'clear_region_btn'):
+            widget.clear_region_btn.setEnabled(False)
+        self._save_posture_cache(widget)
+        self._update_fit_status_label(widget)
+        if getattr(widget, 'view_kind', None) == 'all_view':
+            self._refresh_all_fit_buttons()
+        else:
+            self._update_fit_button_state(widget)
+            self._invalidate_motion_for_posture(widget)
+
+    def _run_fit(self, widget):
+        if not HAS_OPEN3D:
+            widget.log_view.append('open3d が見つかりません。`pip install open3d` を実行してください。')
+            return
+        source = getattr(widget, 'region_mesh', None)
+        target = self._get_base_region_mesh()
+        if source is None:
+            widget.log_view.append('この姿勢の任意領域STLが未読込です。')
+            return
+        if target is None:
+            widget.log_view.append('base の任意領域STLが未読込です。ALL VIEW で読み込んでください。')
+            return
+        params = {
+            'voxel_size': float(widget.fit_voxel_spin.value()),
+            'ransac_iter': int(widget.fit_ransac_iter_spin.value()),
+            'icp_iter': int(widget.fit_icp_iter_spin.value()),
+            'dist_factor': float(widget.fit_dist_spin.value()),
+        }
+        widget.log_view.append('=== フィッティング開始（RANSAC → ICP） ===')
+        widget.fit_btn.setEnabled(False)
+
+        widget.fit_thread = QThread(widget)
+        widget.fit_worker = FitWorker(source, target, params)
+        widget.fit_worker.moveToThread(widget.fit_thread)
+        widget.fit_thread.started.connect(widget.fit_worker.run)
+        widget.fit_worker.log.connect(lambda m: widget.log_view.append(m))
+        widget.fit_worker.finished.connect(lambda res: self._on_fit_finished(widget, res))
+        widget.fit_worker.error.connect(lambda m: self._on_fit_error(widget, m))
+        widget.fit_worker.finished.connect(widget.fit_thread.quit)
+        widget.fit_worker.error.connect(widget.fit_thread.quit)
+        widget.fit_worker.finished.connect(widget.fit_worker.deleteLater)
+        widget.fit_worker.error.connect(widget.fit_worker.deleteLater)
+        widget.fit_thread.finished.connect(widget.fit_thread.deleteLater)
+        widget.fit_thread.start()
+
+    def _on_fit_finished(self, widget, res):
+        widget.fit_transform = np.asarray(res['transform'], dtype=float)
+        widget.fit_result = res
+        widget.log_view.append('=== フィッティング完了 ===')
+        widget.log_view.append(
+            f"  RANSAC: fitness={res['ransac_fitness']:.4f}, RMSE={res['ransac_rmse']:.4f} mm"
+        )
+        widget.log_view.append(
+            f"  ICP   : fitness={res['icp_fitness']:.4f}, RMSE={res['icp_rmse']:.4f} mm"
+        )
+        T = widget.fit_transform
+        widget.log_view.append('  変換行列 T (姿勢STL座標 → base座標):')
+        for r in range(4):
+            widget.log_view.append(
+                f'    [{T[r,0]:+.5f}, {T[r,1]:+.5f}, {T[r,2]:+.5f}, {T[r,3]:+.4f}]'
+            )
+        self._update_fit_status_label(widget)
+        self._update_fit_button_state(widget)
+        widget.fit_btn.setEnabled(True)
+        self._save_posture_cache(widget)
+        self._invalidate_motion_for_posture(widget)
+        self._show_fit_result(widget)
+
+    def _on_fit_error(self, widget, msg):
+        widget.log_view.append(msg)
+        widget.fit_btn.setEnabled(True)
+
+    def _show_fit_result(self, widget):
+        """base 領域（灰）と、変換後の姿勢領域（橙）を別ウィンドウで重ね表示。"""
+        if not HAS_PYVISTA:
+            widget.log_view.append('pyvista が無いため結果を表示できません。')
+            return
+        T = getattr(widget, 'fit_transform', None)
+        source = getattr(widget, 'region_mesh', None)
+        target = self._get_base_region_mesh()
+        if T is None or source is None or target is None:
+            widget.log_view.append('フィッティング結果を表示できません（結果または領域STLが不足）。')
+            return
+        from PyQt6.QtWidgets import QDialog
+        title = getattr(widget, 'c_axis_name', None) or getattr(widget, 'posture_key', '姿勢')
+        dlg = QDialog(widget)
+        dlg.setWindowTitle(f'フィッティング結果: {title}')
+        dlg.resize(880, 660)
+        lay = QVBoxLayout(dlg)
+        info = QLabel('灰: base の任意領域 / 橙: フィッティング後の姿勢領域')
+        lay.addWidget(info)
+        plotter = QtInteractor(dlg)
+        self._setup_plotter_jp_fonts(plotter)
+        background_color, _ = self._load_visual_settings()
+        plotter.set_background(background_color, top=self._background_top_color(background_color))
+        self._configure_lights(plotter)
+        try:
+            plotter.add_mesh(target.copy(), color='#b0b0b0', opacity=0.55,
+                             smooth_shading=True, name='base_region')
+            moved = source.copy()
+            moved.transform(np.asarray(T, dtype=float), inplace=True)
+            plotter.add_mesh(moved, color='#ff9030', opacity=0.65,
+                             smooth_shading=True, name='posture_region')
+            plotter.reset_camera()
+        except Exception as e:
+            widget.log_view.append(f'結果表示中にエラー: {e}')
+        lay.addWidget(plotter.interactor)
+
+        def _on_close(_ev, p=plotter):
+            try:
+                p.close()
+            except Exception:
+                pass
+        dlg.finished.connect(lambda _r: _on_close(None))
+        if not hasattr(self, '_fit_dialogs'):
+            self._fit_dialogs = []
+        self._fit_dialogs.append(dlg)
+        dlg.show()
 
 
 class FEAxisWidget(Tab2Widget):
