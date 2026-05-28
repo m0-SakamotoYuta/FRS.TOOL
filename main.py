@@ -1,4 +1,6 @@
 import sys
+import os  # 👈 追加
+os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"  # 👈 追加（OSのスタイル適用を無効化）
 from PyQt6.QtWidgets import (
 	QApplication,
 	QMainWindow,

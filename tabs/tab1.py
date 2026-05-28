@@ -18,11 +18,20 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QSpinBox,
     QSlider,
+    QCheckBox,
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread, QEvent
 from PyQt6.QtGui import QColor
 
-from tabs.settings import load_settings, save_settings, export_points_data, import_points_data
+from tabs.settings import (
+    load_settings,
+    save_settings,
+    export_points_data,
+    import_points_data,
+    get_lighting_enabled,
+    set_lighting_enabled,
+    register_lighting_listener,
+)
 from splash import LoadingDialog
 
 try:
@@ -153,6 +162,14 @@ class Tab1Widget(QWidget):
         self.reload_btn = QPushButton('キャッシュから再読込')
         left_layout.addWidget(self.load_btn)
         left_layout.addWidget(self.reload_btn)
+
+        self.clear_btn = QPushButton('読み込んだSTLを消去')
+        self.clear_btn.setEnabled(False)
+        left_layout.addWidget(self.clear_btn)
+
+        self.lighting_checkbox = QCheckBox('光源を有効化')
+        self.lighting_checkbox.setChecked(get_lighting_enabled())
+        left_layout.addWidget(self.lighting_checkbox)
 
         self.bg_color_btn = QPushButton('背景色を変更')
         self.model_color_btn = QPushButton('3Dモデル色を変更')
@@ -314,6 +331,8 @@ class Tab1Widget(QWidget):
 
         self.load_btn.clicked.connect(self.on_pick_file)
         self.reload_btn.clicked.connect(self.on_reload_cached)
+        self.clear_btn.clicked.connect(self._clear_stl)
+        self.lighting_checkbox.toggled.connect(self._on_lighting_toggled)
         self.bg_color_btn.clicked.connect(self._pick_background_color)
         self.model_color_btn.clicked.connect(self._pick_model_color)
         self.mode_button_group.buttonToggled.connect(self._on_mode_toggled)
@@ -331,6 +350,8 @@ class Tab1Widget(QWidget):
             self._start_load(cached, show_dialog=True)
         self._refresh_point_list()
         self._log_mode_requirement()
+
+        register_lighting_listener(self._on_global_lighting_changed)
 
     def _append_log(self, text: str):
         self.log_view.append(text)
@@ -962,6 +983,46 @@ class Tab1Widget(QWidget):
             return
         self._start_load(path, show_dialog=True)
 
+    def _clear_stl(self):
+        if self.loading_dialog is not None:
+            try:
+                self.loading_dialog.close()
+            except Exception:
+                pass
+            self.loading_dialog = None
+
+        self.current_mesh = None
+        self.current_path = ''
+        self.path_label.setText('未読み込み')
+
+        # 点群・選択状態をリセット
+        self.mode_points = {spec['label']: [] for spec in self.mode_specs}
+        self.selected_point_index = -1
+        self._refresh_point_list()
+        self._update_point_buttons()
+
+        if self.plotter is not None:
+            try:
+                self.plotter.disable_picking()
+            except Exception:
+                pass
+            self.plotter.clear()
+            self._apply_plotter_background()
+            self._configure_lights()
+            self.plotter.add_text('STLを読み込んでください', position='upper_left', font_size=10)
+            self.plotter.render()
+
+        settings = load_settings() or {}
+        tab1 = settings.setdefault('tab1', {})
+        tab1['stl_path'] = ''
+        tab1['mode_points'] = {}
+        save_settings(settings)
+
+        self.point_add_btn.setChecked(False)
+        self.point_add_btn.setEnabled(False)
+        self.clear_btn.setEnabled(False)
+        self._append_log('STLを消去しました。')
+
     def _start_load(self, path: str, show_dialog: bool):
         self.current_path = path
         self.path_label.setText(path)
@@ -997,6 +1058,18 @@ class Tab1Widget(QWidget):
             return
         self.plotter.remove_all_lights()
 
+        if not get_lighting_enabled():
+            try:
+                self.plotter.enable_eye_dome_lighting()
+            except Exception:
+                pass
+            return
+
+        try:
+            self.plotter.disable_eye_dome_lighting()
+        except Exception:
+            pass
+
         key = pv.Light(position=(3.0, 2.0, 2.5), focal_point=(0.0, 0.0, 0.0), color='white', intensity=1.0)
         fill = pv.Light(position=(-2.0, -1.5, 1.5), focal_point=(0.0, 0.0, 0.0), color='#cfd7ff', intensity=0.45)
         rim = pv.Light(position=(-1.5, 2.5, -2.0), focal_point=(0.0, 0.0, 0.0), color='#fff1d6', intensity=0.35)
@@ -1004,6 +1077,19 @@ class Tab1Widget(QWidget):
         self.plotter.add_light(key)
         self.plotter.add_light(fill)
         self.plotter.add_light(rim)
+
+    def _on_lighting_toggled(self, checked: bool):
+        set_lighting_enabled(bool(checked))
+
+    def _on_global_lighting_changed(self, enabled: bool):
+        if not hasattr(self, 'lighting_checkbox'):
+            return
+        self.lighting_checkbox.blockSignals(True)
+        self.lighting_checkbox.setChecked(bool(enabled))
+        self.lighting_checkbox.blockSignals(False)
+        if self.plotter is not None:
+            self._configure_lights()
+            self.plotter.render()
 
     def _is_mode_ready_for_geometry(self, mode_label: str) -> bool:
         spec = self._get_mode_spec(mode_label)
@@ -2090,6 +2176,7 @@ class Tab1Widget(QWidget):
         self.load_btn.setEnabled(True)
         self.reload_btn.setEnabled(True)
         self.point_add_btn.setEnabled(True)
+        self.clear_btn.setEnabled(True)
         self._append_log('点追加: 「点追加モード」をONにして3D上を左クリックしてください。')
         self._log_mode_requirement()
         self._save_points_cache()
@@ -2103,6 +2190,7 @@ class Tab1Widget(QWidget):
         self.load_btn.setEnabled(True)
         self.reload_btn.setEnabled(True)
         self.point_add_btn.setEnabled(self.current_mesh is not None)
+        self.clear_btn.setEnabled(self.current_mesh is not None)
         if self.loading_dialog is not None:
             self.loading_dialog.append_log(msg)
             self.loading_dialog.close()

@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup, QScrollArea, QPushButton, QFileDialog, QTextEdit, QListWidget,
     QSlider, QSpinBox, QCheckBox, QLineEdit
 )
-from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QEvent
 from PyQt6.QtGui import QColor
 import os
 import numpy as np
@@ -15,7 +15,13 @@ try:
 except Exception:
     HAS_PYVISTA = False
 
-from tabs.settings import load_settings, save_settings
+from tabs.settings import (
+    load_settings,
+    save_settings,
+    get_lighting_enabled,
+    set_lighting_enabled,
+    register_lighting_listener,
+)
 
 
 class DnDWidget(QWidget):
@@ -87,7 +93,7 @@ class STLLoadWorker(QObject):
         try:
             self.log.emit('STL読み込みを開始します...')
             mesh = pv.read(self.path)
-            mesh = mesh.extract_surface().triangulate()
+            mesh = mesh.extract_surface(algorithm='dataset_surface').triangulate()
             self.log.emit('法線を計算します...')
             mesh = mesh.compute_normals(
                 cell_normals=False,
@@ -129,6 +135,7 @@ class Tab2Widget(QWidget):
         # 軸ごとに独立した posture_widgets を保持: {'u': {...}, 'v': {...}, 'w': {...}}
         self.axis_data = {}
         self.visual_widgets = []
+        self.lighting_checkboxes = []
         # C_world 座標系での共有カメラ姿勢（タブ間で引き継ぐ）
         self.shared_camera_world = None
         # 手動で「記録」した視点（C_world 座標系）
@@ -136,6 +143,7 @@ class Tab2Widget(QWidget):
         self.all_view_widget = None
         self._load_shared_camera_cache()
         self._load_recorded_view_cache()
+        register_lighting_listener(self._on_global_lighting_changed)
 
         layout = QVBoxLayout(self)
 
@@ -319,18 +327,92 @@ class Tab2Widget(QWidget):
         except Exception:
             pass
 
-    def _configure_lights(self, plotter):
+    def _configure_lights(self, plotter, c_world=None, scene_scale=None):
         if plotter is None or not HAS_PYVISTA:
             return
         plotter.remove_all_lights()
 
-        key = pv.Light(position=(3.0, 2.0, 2.5), focal_point=(0.0, 0.0, 0.0), color='white', intensity=1.0)
-        fill = pv.Light(position=(-2.0, -1.5, 1.5), focal_point=(0.0, 0.0, 0.0), color='#cfd7ff', intensity=0.45)
-        rim = pv.Light(position=(-1.5, 2.5, -2.0), focal_point=(0.0, 0.0, 0.0), color='#fff1d6', intensity=0.35)
+        if not get_lighting_enabled():
+            try:
+                plotter.enable_eye_dome_lighting()
+            except Exception:
+                pass
+            return
+
+        try:
+            plotter.disable_eye_dome_lighting()
+        except Exception:
+            pass
+
+        if c_world is None or scene_scale is None:
+            key = pv.Light(position=(3.0, 2.0, 2.5), focal_point=(0.0, 0.0, 0.0), color='white', intensity=1.0)
+            fill = pv.Light(position=(-2.0, -1.5, 1.5), focal_point=(0.0, 0.0, 0.0), color='#cfd7ff', intensity=0.45)
+            rim = pv.Light(position=(-1.5, 2.5, -2.0), focal_point=(0.0, 0.0, 0.0), color='#fff1d6', intensity=0.35)
+
+            plotter.add_light(key)
+            plotter.add_light(fill)
+            plotter.add_light(rim)
+            return
+
+        origin = np.asarray(c_world.get('origin', [0.0, 0.0, 0.0]), dtype=float)
+        ex = np.asarray(c_world.get('ex', [1.0, 0.0, 0.0]), dtype=float)
+        ez = np.asarray(c_world.get('ez', [0.0, 0.0, 1.0]), dtype=float)
+        ex_norm = float(np.linalg.norm(ex)) or 1.0
+        ez_norm = float(np.linalg.norm(ez)) or 1.0
+        ex = ex / ex_norm
+        ez = ez / ez_norm
+
+        dist = max(float(scene_scale) * 1.2, 1.0)
+        key_pos = origin + ex * dist
+        fill_pos = origin - ex * dist * 0.6
+        rim_pos = origin + ez * dist * 0.6
+
+        key = pv.Light(position=tuple(key_pos), focal_point=tuple(origin), color='white', intensity=1.0)
+        fill = pv.Light(position=tuple(fill_pos), focal_point=tuple(origin), color='#cfd7ff', intensity=0.35)
+        rim = pv.Light(position=tuple(rim_pos), focal_point=tuple(origin), color='#fff1d6', intensity=0.25)
 
         plotter.add_light(key)
         plotter.add_light(fill)
         plotter.add_light(rim)
+
+    def _add_lighting_toggle(self, left_layout, widget):
+        cb = QCheckBox('光源を有効化')
+        cb.setChecked(get_lighting_enabled())
+        cb.toggled.connect(self._on_lighting_toggled)
+        left_layout.addWidget(cb)
+        self.lighting_checkboxes.append(cb)
+        widget.lighting_checkbox = cb
+
+    def _on_lighting_toggled(self, checked: bool):
+        set_lighting_enabled(bool(checked))
+
+    def _on_global_lighting_changed(self, enabled: bool):
+        for cb in list(self.lighting_checkboxes):
+            if cb is None:
+                continue
+            cb.blockSignals(True)
+            cb.setChecked(bool(enabled))
+            cb.blockSignals(False)
+        self._refresh_all_lighting()
+
+    def _refresh_all_lighting(self):
+        for widget in list(self.visual_widgets):
+            plotter = getattr(widget, 'plotter', None)
+            if plotter is None:
+                continue
+            view_kind = getattr(widget, 'view_kind', '')
+            if view_kind == 'all_view':
+                if getattr(widget, 'current_mesh', None) is not None:
+                    self._render_all_view(widget, reset_view=False)
+                else:
+                    self._reset_plotter_placeholder(widget.plotter, 'STL(base) を読み込んでください')
+            elif view_kind == 'posture':
+                if getattr(widget, 'current_mesh', None) is not None:
+                    self._render_posture1_plotter(widget, reset_view=False)
+                else:
+                    self._reset_plotter_placeholder(widget.plotter, 'STLを読み込んでください')
+            elif view_kind == 'motion':
+                self._render_motion_view(widget)
     
     def _create_simple_axis_tab(self, axis_name: str) -> QWidget:
         """シンプルなプレースホルダータブを作成。"""
@@ -375,6 +457,12 @@ class Tab2Widget(QWidget):
 
         load_btn = QPushButton('STL(base) を読み込む')
         left_layout.addWidget(load_btn)
+
+        clear_stl_btn = QPushButton('読み込んだSTLを消去')
+        clear_stl_btn.setEnabled(False)
+        left_layout.addWidget(clear_stl_btn)
+
+        self._add_lighting_toggle(left_layout, widget)
 
         build_world_btn = QPushButton('C_world 座標系を生成')
         build_world_btn.setEnabled(False)
@@ -502,6 +590,7 @@ class Tab2Widget(QWidget):
 
         widget.plotter = plotter
         widget.display_in_world_frame = False  # base STL は自前の座標系で表示
+        widget.view_kind = 'all_view'
         self._attach_camera_observer(widget)
 
         # === 下段: ログ ===
@@ -553,6 +642,7 @@ class Tab2Widget(QWidget):
 
         # === 状態保持 ===
         widget.load_btn = load_btn
+        widget.clear_stl_btn = clear_stl_btn
         widget.build_world_btn = build_world_btn
         widget.clear_world_btn = clear_world_btn
         widget.import_rotation_btn = import_rotation_btn
@@ -591,6 +681,7 @@ class Tab2Widget(QWidget):
                 f'読込要求: {path}' + ('（キャッシュ復元）' if preserve_state else '')
             )
             widget.load_btn.setEnabled(False)
+            widget.clear_stl_btn.setEnabled(False)
 
             widget.thread = QThread(widget)
             widget.worker = STLLoadWorker(path)
@@ -648,11 +739,13 @@ class Tab2Widget(QWidget):
             widget.import_parallel_btn.setEnabled(widget.c_world is not None)
             widget.log_view.append('完了')
             widget.load_btn.setEnabled(True)
+            widget.clear_stl_btn.setEnabled(True)
             self._save_posture_cache(widget)
 
         def _on_load_error(msg: str):
             widget.log_view.append(msg)
             widget.load_btn.setEnabled(True)
+            widget.clear_stl_btn.setEnabled(widget.current_mesh is not None)
 
         widget._start_load = _start_load
         widget._on_mesh_loaded = _on_mesh_loaded
@@ -681,7 +774,7 @@ class Tab2Widget(QWidget):
                 try:
                     widget.plotter.enable_surface_point_picking(
                         callback=lambda point, *_args: self._on_plane_surface_point_picked(active, point),
-                        left_clicking=True, show_point=False, pickable_window=False,
+                        left_clicking=True, right_clicking=True, show_point=False, pickable_window=False,
                     )
                 except Exception:
                     pass
@@ -691,6 +784,7 @@ class Tab2Widget(QWidget):
 
         # === ボタン接続 ===
         load_btn.clicked.connect(lambda: self._open_posture_file(widget))
+        clear_stl_btn.clicked.connect(lambda: self._clear_all_view_stl(widget))
         build_world_btn.clicked.connect(lambda: self._build_c_world_for_all_view(widget))
         clear_world_btn.clicked.connect(lambda: self._clear_c_world_for_all_view(widget))
         import_rotation_btn.clicked.connect(lambda: self._import_axes(widget, kind='rotation'))
@@ -755,6 +849,76 @@ class Tab2Widget(QWidget):
         widget.log_view.append('C_world 座標系を消去しました。回転軸の取り込みもクリアしました。')
         self._render_all_view(widget, reset_view=False)
         self._save_posture_cache(widget)
+
+    def _reset_plotter_placeholder(self, plotter, message: str):
+        if plotter is None or not HAS_PYVISTA:
+            return
+        try:
+            plotter.disable_picking()
+        except Exception:
+            pass
+        plotter.clear()
+        background_color, _model_color = self._load_visual_settings()
+        plotter.set_background(background_color, top=self._background_top_color(background_color))
+        self._configure_lights(plotter)
+        plotter.add_text(message, position='upper_left', font_size=10)
+        plotter.render()
+
+    def _clear_all_view_stl(self, widget):
+        widget.current_mesh = None
+        widget.stl_path = None
+        widget.c_world = None
+        widget.rotation_axes = None
+        widget.parallel_axes = None
+        widget.intersection_point = None
+        widget.intersection_distances = None
+        widget.parallel_pair_angles = None
+        widget.check_label.setText('（軸を取り込むと結果がここに表示されます）')
+
+        for plane_widget in widget.plane_widgets:
+            plane_widget.current_mesh = None
+            plane_widget.points.clear()
+            plane_widget.selected_point_index = -1
+            plane_widget.point_add_enabled = False
+            plane_widget.point_add_btn.setChecked(False)
+            plane_widget.point_add_btn.setEnabled(False)
+            plane_widget._refresh_point_list()
+
+        self._reset_plotter_placeholder(widget.plotter, 'STL(base) を読み込んでください')
+
+        widget.build_world_btn.setEnabled(False)
+        widget.clear_world_btn.setEnabled(False)
+        widget.import_rotation_btn.setEnabled(False)
+        widget.import_parallel_btn.setEnabled(False)
+        widget.clear_stl_btn.setEnabled(False)
+        widget.log_view.append('STLを消去しました。')
+        self._save_posture_cache(widget)
+
+    def _clear_posture_stl(self, posture_widget):
+        posture_widget.current_mesh = None
+        posture_widget.stl_path = None
+        posture_widget.c_axis = None
+        posture_widget.c_world = None
+
+        for plane_widget in posture_widget.plane_widgets:
+            plane_widget.current_mesh = None
+            plane_widget.points.clear()
+            plane_widget.selected_point_index = -1
+            plane_widget.point_add_enabled = False
+            plane_widget.point_add_btn.setChecked(False)
+            plane_widget.point_add_btn.setEnabled(False)
+            plane_widget._refresh_point_list()
+
+        self._reset_plotter_placeholder(posture_widget.plotter, 'STLを読み込んでください')
+
+        posture_widget.build_axis_btn.setEnabled(False)
+        posture_widget.clear_axis_btn.setEnabled(False)
+        posture_widget.build_world_btn.setEnabled(False)
+        posture_widget.clear_world_btn.setEnabled(False)
+        posture_widget.clear_stl_btn.setEnabled(False)
+        posture_widget.log_view.append('STLを消去しました。')
+        self._save_posture_cache(posture_widget)
+        self._invalidate_motion_for_posture(posture_widget)
 
     def _on_sphere_size_changed(self, widget, value):
         # QSpinBox が値を表示するため、ここでは再描画のみ
@@ -1126,12 +1290,12 @@ class Tab2Widget(QWidget):
             return None
         subtabs = ad['subtabs']
         idx = subtabs.currentIndex()
-        # 0/1/2 = posture1/2/3, 3 = motion-axis
-        if 0 <= idx <= 2:
-            pw_list = list(ad['posture_widgets'].values())
-            if idx < len(pw_list):
-                return pw_list[idx]
-        return ad.get('motion_widget')
+        posture_labels = list(type(self).POSTURE_LABELS)
+        if 0 <= idx < len(posture_labels):
+            return ad['posture_widgets'].get(posture_labels[idx])
+        if idx == len(posture_labels):
+            return ad.get('motion_widget')
+        return None
 
     def _on_axis_subtab_changed(self, axis_letter):
         widget = self._active_widget_in_axis(axis_letter)
@@ -1411,7 +1575,9 @@ class Tab2Widget(QWidget):
         plotter.clear()
         bg, model_color = self._load_visual_settings()
         plotter.set_background(bg, top=self._background_top_color(bg))
-        self._configure_lights(plotter)
+        b = widget.current_mesh.bounds
+        diag = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]])) or 100.0
+        self._configure_lights(plotter, widget.c_world, diag if widget.c_world is not None else None)
         plotter.hide_axes()
 
         plotter.add_mesh(
@@ -1481,8 +1647,6 @@ class Tab2Widget(QWidget):
                 pass
 
         # シーン基準長
-        b = widget.current_mesh.bounds
-        diag = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]])) or 100.0
 
         # C_world 座標軸（STL 座標系で描画）
         if widget.c_world is not None:
@@ -1612,7 +1776,7 @@ class Tab2Widget(QWidget):
             try:
                 plotter.enable_surface_point_picking(
                     callback=lambda point, *_args: self._on_plane_surface_point_picked(active_plane, point),
-                    left_clicking=True, show_point=False, pickable_window=False,
+                    left_clicking=True, right_clicking=True, show_point=False, pickable_window=False,
                 )
             except Exception:
                 pass
@@ -1708,6 +1872,8 @@ class Tab2Widget(QWidget):
 
         compute_btn = QPushButton(f'{widget.motion_label_jp}を計算 / 表示更新')
         left_layout.addWidget(compute_btn)
+
+        self._add_lighting_toggle(left_layout, widget)
 
         # === 視点記録ボタン ===
         view_btn_row = QHBoxLayout()
@@ -1923,6 +2089,7 @@ class Tab2Widget(QWidget):
 
         widget.plotter = plotter
         widget.display_in_world_frame = True  # motion-axis タブは C_world 系で表示
+        widget.view_kind = 'motion'
         self._attach_camera_observer(widget)
         widget.log_view = log_view
         widget.compute_btn = compute_btn
@@ -2537,6 +2704,12 @@ class Tab2Widget(QWidget):
         load_btn = QPushButton('STLを読み込む')
         left_layout.addWidget(load_btn)
 
+        clear_stl_btn = QPushButton('読み込んだSTLを消去')
+        clear_stl_btn.setEnabled(False)
+        left_layout.addWidget(clear_stl_btn)
+
+        self._add_lighting_toggle(left_layout, widget)
+
         is_fe = bool(getattr(self, 'fe_mode', False))
         if is_fe:
             build_axis_label = 'ローカル座標系を生成'
@@ -2749,6 +2922,7 @@ class Tab2Widget(QWidget):
 
         widget.plotter = plotter
         widget.display_in_world_frame = False  # posture STL は自前の座標系で表示
+        widget.view_kind = 'posture'
         self._attach_camera_observer(widget)
 
         # === 下段: ログビュー（全幅） ===
@@ -2806,6 +2980,7 @@ class Tab2Widget(QWidget):
         main_layout.addWidget(log_view, 1)
 
         widget.load_btn = load_btn
+        widget.clear_stl_btn = clear_stl_btn
         widget.build_axis_btn = build_axis_btn
         widget.clear_axis_btn = clear_axis_btn
         widget.build_world_btn = build_world_btn
@@ -2881,6 +3056,7 @@ class Tab2Widget(QWidget):
             widget.clear_world_btn.setEnabled(widget.c_world is not None)
             widget.log_view.append('完了')
             widget.load_btn.setEnabled(True)
+            widget.clear_stl_btn.setEnabled(True)
             self._save_posture_cache(widget)
             # 新規 STL ロード（非 preserve）はソース変更 → motion-axis を無効化
             if not preserve:
@@ -2891,8 +3067,10 @@ class Tab2Widget(QWidget):
         def _on_load_error(msg: str):
             widget.log_view.append(msg)
             widget.load_btn.setEnabled(True)
+            widget.clear_stl_btn.setEnabled(widget.current_mesh is not None)
 
         load_btn.clicked.connect(lambda: self._open_posture_file(widget))
+        clear_stl_btn.clicked.connect(lambda: self._clear_posture_stl(widget))
         build_axis_btn.clicked.connect(lambda: self._build_c_axis(widget))
         clear_axis_btn.clicked.connect(lambda: self._clear_c_axis(widget))
         build_world_btn.clicked.connect(lambda: self._build_c_world_axis(widget))
@@ -2929,6 +3107,7 @@ class Tab2Widget(QWidget):
                     widget.plotter.enable_surface_point_picking(
                         callback=lambda point, *_args: self._on_plane_surface_point_picked(active, point),
                         left_clicking=True,
+                        right_clicking=True,
                         show_point=False,
                         pickable_window=False,
                     )
@@ -3034,6 +3213,7 @@ class Tab2Widget(QWidget):
                         widget.plotter.enable_surface_point_picking(
                             callback=lambda point, *_args: self._on_plane_surface_point_picked(widget, point),
                             left_clicking=True,
+                            right_clicking=True,
                             show_point=False,
                             pickable_window=False,
                         )
@@ -3086,6 +3266,11 @@ class Tab2Widget(QWidget):
         widget.delete_last_btn.clicked.connect(widget._on_delete_last)
         widget.clear_points_btn.clicked.connect(widget._on_clear_points)
 
+        try:
+            self._install_right_click_pick_handler(widget.posture_widget)
+        except Exception:
+            pass
+
     def _update_plane_point_buttons(self, widget):
         points = getattr(widget, 'points', [])
         has_points = len(points) > 0
@@ -3094,8 +3279,172 @@ class Tab2Widget(QWidget):
         widget.delete_last_btn.setEnabled(has_points)
         widget.clear_points_btn.setEnabled(has_points)
 
-    def _on_plane_surface_point_picked(self, widget, point, *_args):
-        if not getattr(widget, 'point_add_enabled', False):
+    def _get_active_plane_widget(self, posture_widget):
+        plane_widgets = getattr(posture_widget, 'plane_widgets', [])
+        if not plane_widgets:
+            return None
+        active_index = getattr(posture_widget, 'active_plane_index', 0)
+        if 0 <= active_index < len(plane_widgets):
+            return plane_widgets[active_index]
+        return None
+
+    def _pick_point_from_plotter(self, plotter, x=None, y=None):
+        if plotter is None:
+            return None
+        iren = getattr(plotter, 'iren', None) or getattr(plotter, 'interactor', None)
+        if iren is None:
+            return None
+        if x is None or y is None:
+            try:
+                x, y = iren.GetEventPosition()
+            except Exception:
+                return None
+
+        qt_interactor = getattr(plotter, 'interactor', None)
+        ratio = 1.0
+        if qt_interactor is not None and hasattr(qt_interactor, 'devicePixelRatioF'):
+            try:
+                ratio = float(qt_interactor.devicePixelRatioF()) or 1.0
+            except Exception:
+                ratio = 1.0
+
+        try:
+            x = int(round(float(x) * ratio))
+            y = int(round(float(y) * ratio))
+        except Exception:
+            return None
+
+        try:
+            renderer = plotter.renderer
+        except Exception:
+            renderer = None
+        if renderer is None:
+            return None
+
+        render_window = getattr(plotter, 'ren_win', None)
+        if render_window is None:
+            render_window = getattr(plotter, 'render_window', None)
+        if render_window is not None:
+            try:
+                _w, h = render_window.GetSize()
+                y = max(0, int(h) - 1 - int(y))
+            except Exception:
+                pass
+
+        picker = getattr(plotter, 'picker', None)
+        if picker is None:
+            try:
+                from vtkmodules.vtkRenderingCore import vtkCellPicker
+
+                picker = vtkCellPicker()
+                picker.SetTolerance(0.0005)
+            except Exception:
+                return None
+
+        try:
+            picked = picker.Pick(x, y, 0, renderer)
+        except Exception:
+            return None
+        if not picked:
+            return None
+        try:
+            pos = picker.GetPickPosition()
+        except Exception:
+            return None
+        if pos is None:
+            return None
+        return np.array(pos, dtype=float)
+
+    def _install_right_click_pick_handler(self, posture_widget):
+        plotter = getattr(posture_widget, 'plotter', None)
+        if plotter is None or not HAS_PYVISTA:
+            return
+        if getattr(posture_widget, '_right_click_observer_id', None) is not None:
+            return
+
+        qt_interactor = getattr(plotter, 'interactor', None)
+        if qt_interactor is None:
+            return
+
+        try:
+            qt_interactor.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
+
+        class _RightClickFilter(QObject):
+            def __init__(self, parent, host):
+                super().__init__(parent)
+                self._host = host
+
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
+                    w = self._host
+                    if getattr(w, 'current_mesh', None) is None:
+                        return False
+                    active_plane = self._host._get_active_plane_widget(w)
+                    if active_plane is None:
+                        return False
+                    try:
+                        pos = event.position()
+                        x = int(pos.x())
+                        y = int(pos.y())
+                    except Exception:
+                        try:
+                            x = int(event.x())
+                            y = int(event.y())
+                        except Exception:
+                            return False
+                    point = self._host._pick_point_from_plotter(w.plotter, x=x, y=y)
+                    if point is None:
+                        return False
+                    self._host._on_plane_surface_point_picked(active_plane, point, force=True)
+                elif event.type() == QEvent.Type.KeyPress:
+                    try:
+                        key = event.key()
+                    except Exception:
+                        key = None
+                    if key == Qt.Key.Key_T:
+                        w = self._host
+                        self._host._toggle_point_add_mode(w)
+                        return True
+                return False
+
+        filter_obj = _RightClickFilter(qt_interactor, self)
+        qt_interactor.installEventFilter(filter_obj)
+        posture_widget._right_click_filter = filter_obj
+        posture_widget._right_click_observer_id = 'qt_event_filter'
+
+    def _pick_point_with_normal(self, plotter, mesh, x=None, y=None):
+        point = self._pick_point_from_plotter(plotter, x=x, y=y)
+        if point is None or mesh is None:
+            return None, None
+        normal = None
+        try:
+            normals = getattr(mesh, 'point_normals', None)
+            if normals is not None and len(normals):
+                idx = int(mesh.find_closest_point(point))
+                if 0 <= idx < len(normals):
+                    normal = np.array(normals[idx], dtype=float)
+        except Exception:
+            normal = None
+        if normal is None or np.linalg.norm(normal) < 1e-9:
+            normal = np.array([0.0, 0.0, 1.0], dtype=float)
+        return np.array(point, dtype=float), normal
+
+    def _toggle_point_add_mode(self, posture_widget):
+        active_plane = self._get_active_plane_widget(posture_widget)
+        if active_plane is None:
+            return
+        btn = getattr(active_plane, 'point_add_btn', None)
+        if btn is None:
+            return
+        try:
+            btn.setChecked(not btn.isChecked())
+        except Exception:
+            pass
+
+    def _on_plane_surface_point_picked(self, widget, point, *_args, force: bool = False):
+        if not force and not getattr(widget, 'point_add_enabled', False):
             return
         if point is None:
             return
@@ -3134,7 +3483,9 @@ class Tab2Widget(QWidget):
         plotter.clear()
         background_color, model_color = self._load_visual_settings()
         plotter.set_background(background_color, top=self._background_top_color(background_color))
-        self._configure_lights(plotter)
+        b = posture_widget.current_mesh.bounds
+        diag = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]])) or 100.0
+        self._configure_lights(plotter, posture_widget.c_world, diag if posture_widget.c_world is not None else None)
         plotter.add_mesh(
             posture_widget.current_mesh,
             name='stl_model',
@@ -3249,6 +3600,7 @@ class Tab2Widget(QWidget):
                 plotter.enable_surface_point_picking(
                     callback=lambda point, *_args: self._on_plane_surface_point_picked(active_plane, point),
                     left_clicking=True,
+                    right_clicking=True,
                     show_point=False,
                     pickable_window=False,
                 )
@@ -3783,12 +4135,14 @@ class FEAxisWidget(Tab2Widget):
         self.fe_mode = True
         self.axis_data = {}
         self.visual_widgets = []
+        self.lighting_checkboxes = []
         self.shared_camera_world = None
         self.recorded_view_world = None
         self.all_view_widget = None
         # 共有カメラ・記録視点は別のキー名で読み書きされるので、main の Ver.2 とは独立
         self._load_shared_camera_cache()
         self._load_recorded_view_cache()
+        register_lighting_listener(self._on_global_lighting_changed)
 
         layout = QVBoxLayout(self)
         # 「FE軸検証」というラベルのサブタブを 1 つだけ持つ QTabWidget を配置。

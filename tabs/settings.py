@@ -2,6 +2,10 @@ import json
 import os
 from pathlib import Path
 
+_LIGHTING_KEY = 'lighting_enabled'
+_lighting_enabled_cache = None
+_lighting_listeners = []
+
 
 def _get_settings_path() -> Path:
     base = os.getenv('APPDATA') or str(Path.home())
@@ -69,3 +73,35 @@ def apply_theme(app, dark: bool):
         app.setStyleSheet(dark_style)
     else:
         app.setStyleSheet('')
+
+
+def get_lighting_enabled() -> bool:
+    global _lighting_enabled_cache
+    if _lighting_enabled_cache is None:
+        settings = load_settings() or {}
+        _lighting_enabled_cache = bool(settings.get(_LIGHTING_KEY, True))
+    return bool(_lighting_enabled_cache)
+
+
+def set_lighting_enabled(enabled: bool) -> None:
+    global _lighting_enabled_cache
+    _lighting_enabled_cache = bool(enabled)
+    settings = load_settings() or {}
+    settings[_LIGHTING_KEY] = bool(enabled)
+    save_settings(settings)
+    _notify_lighting_listeners(bool(enabled))
+
+
+def register_lighting_listener(callback) -> None:
+    if not callable(callback):
+        return
+    if callback not in _lighting_listeners:
+        _lighting_listeners.append(callback)
+
+
+def _notify_lighting_listeners(enabled: bool) -> None:
+    for cb in list(_lighting_listeners):
+        try:
+            cb(bool(enabled))
+        except Exception:
+            pass
