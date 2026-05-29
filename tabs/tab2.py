@@ -3279,6 +3279,35 @@ class Tab2Widget(QWidget):
         clear_caxis_btn.setText(f'{widget.c_axis_label_prefix} を消去')
         widget.clear_caxis_btn = clear_caxis_btn
 
+        # 表示トグル（C_world / C_*-axis）。既定は表示。
+        widget.show_cworld_overlay = True
+        widget.show_caxis_overlay = True
+
+        def _make_vis_toggle(name):
+            b = QPushButton(f'{name}（表示中）')
+            b.setCheckable(True)
+            b.setChecked(True)
+            return b
+
+        show_world_btn = _make_vis_toggle('C_world')
+        show_caxis_btn = _make_vis_toggle(widget.c_axis_name)
+        widget.show_world_btn = show_world_btn
+        widget.show_caxis_btn = show_caxis_btn
+
+        def _on_vis_toggle(kind, checked, w=widget):
+            if kind == 'cworld':
+                w.show_cworld_overlay = bool(checked)
+                w.show_world_btn.setText('C_world（表示中）' if checked else 'C_world（非表示）')
+            else:
+                w.show_caxis_overlay = bool(checked)
+                w.show_caxis_btn.setText(
+                    f'{w.c_axis_name}（表示中）' if checked else f'{w.c_axis_name}（非表示）'
+                )
+            if getattr(w, 'current_mesh', None) is not None:
+                self._render_posture1_plotter(w, reset_view=False)
+        show_world_btn.toggled.connect(lambda c: _on_vis_toggle('cworld', c))
+        show_caxis_btn.toggled.connect(lambda c: _on_vis_toggle('caxis', c))
+
         def _make_param_row(layout, label_text, lo, hi, default, decimals=0, suffix=''):
             row = QHBoxLayout()
             lbl = QLabel(label_text)
@@ -3320,6 +3349,7 @@ class Tab2Widget(QWidget):
             g1l.addWidget(clear_region_btn)
             g1l.addWidget(fit_btn)
             g1l.addWidget(fit_check_btn)
+            g1l.addWidget(show_world_btn)   # C_world 表示/非表示（固定部フィット結果の確認の下）
             fit_status = QLabel('未フィッティング')
             fit_status.setWordWrap(True); fit_status.setStyleSheet('color: #cfa; font-size: 11px;')
             widget.fit_status_label = fit_status
@@ -3334,13 +3364,14 @@ class Tab2Widget(QWidget):
             g2l.addWidget(fit_link_btn)
             g2l.addWidget(fit_link_check_btn)
             g2l.addWidget(clear_caxis_btn)
+            g2l.addWidget(show_caxis_btn)   # C_*-axis_posin 表示/非表示（C_*-axis を消去の下）
             fit_link_status = QLabel('未フィッティング')
             fit_link_status.setWordWrap(True); fit_link_status.setStyleSheet('color: #cfa; font-size: 11px;')
             widget.fit_link_status_label = fit_link_status
             g2l.addWidget(fit_link_status)
             left_layout.addWidget(g2)
         elif is_base_pose:
-            # base 姿勢: アーム領域STL（フィット#2 の基準）を読み込むだけ
+            # base 姿勢: アーム領域STL（フィット#2 の基準）を読み込む + 表示トグル
             gl = QGroupBox(f'アーム({widget.c_axis_label_prefix})領域（フィット基準）')
             gll = QVBoxLayout(gl)
             load_link_btn.setText('base のアーム領域STLを読み込む')
@@ -3348,6 +3379,12 @@ class Tab2Widget(QWidget):
             gll.addWidget(load_link_btn)
             gll.addWidget(clear_link_btn)
             left_layout.addWidget(gl)
+
+            vg = QGroupBox('座標系の表示')
+            vgl = QVBoxLayout(vg)
+            vgl.addWidget(show_world_btn)   # C_world 表示/非表示
+            vgl.addWidget(show_caxis_btn)   # C_*-axis_base 表示/非表示
+            left_layout.addWidget(vg)
 
         self._add_lighting_toggle(left_layout, widget)
 
@@ -4715,6 +4752,42 @@ class Tab2Widget(QWidget):
         self._save_posture_cache(posture_widget)
         self._invalidate_motion_for_posture(posture_widget)
 
+    def _frames_for_posture_view(self, widget):
+        """姿勢/base タブの 3D ビューに描く (C_*-axis, C_world) を、その STL 座標系で返す。
+
+        - 旧方式(FE): widget.c_axis / widget.c_world をそのまま使用。
+        - 新方式: C_world はフィットから逆算（_effective_c_world_for_widget）。
+          C_*-axis は base 姿勢なら widget.c_axis（F_L）、姿勢1〜5なら
+          inv(T_arm) ∘ F_L（F_L = base 姿勢の C_*-axis_base）。
+        戻り値: (caxis_frame, cworld_frame) いずれも dict か None。
+        """
+        if not getattr(widget, 'use_base_fit', False):
+            return getattr(widget, 'c_axis', None), getattr(widget, 'c_world', None)
+
+        cworld_frame = self._effective_c_world_for_widget(widget)
+
+        if getattr(widget, 'is_base_pose', False):
+            return getattr(widget, 'c_axis', None), cworld_frame
+
+        # 姿勢1〜5: アームフィット inv(T_arm) を base の C_*-axis_base に適用
+        caxis_frame = None
+        Tl = getattr(widget, 'fit_link_transform', None)
+        ad = self.axis_data.get(getattr(widget, 'axis_letter', None))
+        base_pose = ad.get('base_widget') if ad else None
+        F_L = getattr(base_pose, 'c_axis', None) if base_pose else None
+        if Tl is not None and F_L is not None:
+            try:
+                inv = np.linalg.inv(np.asarray(Tl, dtype=float))
+            except Exception:
+                inv = None
+            if inv is not None:
+                R_FL = np.column_stack([F_L['ex'], F_L['ey'], F_L['ez']])
+                O_FL = np.asarray(F_L['origin'], dtype=float)
+                R = inv[:3, :3] @ R_FL
+                O = inv[:3, :3] @ O_FL + inv[:3, 3]
+                caxis_frame = {'ex': R[:, 0], 'ey': R[:, 1], 'ez': R[:, 2], 'origin': O}
+        return caxis_frame, cworld_frame
+
     def _draw_c_axis(self, posture_widget):
         """姿勢上の 2 つの座標系（C_u-axis_posi_i と C_world）を 3D ビューに描画。"""
         plotter = getattr(posture_widget, 'plotter', None)
@@ -4736,10 +4809,18 @@ class Tab2Widget(QWidget):
         rad_factor = float(getattr(posture_widget, 'axis_radius_factor', 1.0) or 1.0)
         show_caps = bool(getattr(posture_widget, 'show_captions', True))
 
+        # 描画するフレーム（新方式はフィットから逆算、旧方式はウィジェット属性）
+        caxis_frame, cworld_frame = self._frames_for_posture_view(posture_widget)
+        # 表示トグル（既定: 表示）
+        if not bool(getattr(posture_widget, 'show_caxis_overlay', True)):
+            caxis_frame = None
+        if not bool(getattr(posture_widget, 'show_cworld_overlay', True)):
+            cworld_frame = None
+
         systems = [
             {
                 'key': 'c_axis',
-                'frame': getattr(posture_widget, 'c_axis', None),
+                'frame': caxis_frame,
                 'label': getattr(posture_widget, 'c_axis_name', 'C_u-axis'),
                 'label_color': '#ffffaa',
                 'origin_color': '#ffff66',
@@ -4750,7 +4831,7 @@ class Tab2Widget(QWidget):
             },
             {
                 'key': 'c_world',
-                'frame': getattr(posture_widget, 'c_world', None),
+                'frame': cworld_frame,
                 'label': 'C_world',
                 'label_color': '#bfe4ff',
                 'origin_color': '#80c0ff',
@@ -5123,12 +5204,15 @@ class Tab2Widget(QWidget):
         self._save_posture_cache(widget)
         self._invalidate_motion_for_posture(widget)
         # 固定部フィットは STL↔C_world を結ぶので照明・視点を同期反映
-        if slot == 'world' and getattr(widget, 'current_mesh', None) is not None:
+        # 固定部/アームどちらのフィットでも、確定したフレーム(C_world/C_*-axis)を
+        # 姿勢ビューに反映するため再描画する。
+        if getattr(widget, 'current_mesh', None) is not None:
             try:
                 self._render_posture1_plotter(widget, reset_view=False)
             except Exception:
                 pass
-            if self.shared_camera_world is not None:
+            # 固定部フィットは STL↔C_world を結ぶので視点も同期
+            if slot == 'world' and self.shared_camera_world is not None:
                 self._apply_shared_camera_with_render(widget)
         self._show_fit_result(widget, slot)
 
