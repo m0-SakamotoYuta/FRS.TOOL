@@ -265,11 +265,17 @@ class Tab2Widget(QWidget):
         layout = QVBoxLayout(self)
 
         self.top_subtabs = QTabWidget()
+        # ALL VIEW 本体は単一インスタンス。トップタブと各軸タブの先頭サブタブの
+        # ホストへ、タブ切替時に付け替える（reparent）ことで完全同期させる。
+        self.all_view_widget = self._create_all_view_tab()
+        self.all_view_host_main = QWidget()
+        _host_layout = QVBoxLayout(self.all_view_host_main)
+        _host_layout.setContentsMargins(0, 0, 0, 0)
+
         axis_names = ['ALL VIEW', 'U axis', 'V axis', 'W axis', 'X axis', 'Y axis', 'Z axis']
         for axis_name in axis_names:
             if axis_name == 'ALL VIEW':
-                axis_widget = self._create_all_view_tab()
-                self.all_view_widget = axis_widget
+                axis_widget = self.all_view_host_main
             elif axis_name in ('U axis', 'V axis', 'W axis'):
                 letter = axis_name[0].lower()  # 'u' / 'v' / 'w'
                 axis_widget = self._create_axis_tab(letter, joint_type='rotation')
@@ -280,7 +286,10 @@ class Tab2Widget(QWidget):
                 axis_widget = self._create_simple_axis_tab(axis_name)
             self.top_subtabs.addTab(axis_widget, axis_name)
 
-        # トップ階層タブの切替で、現在表示中のプロッタへ共有カメラを反映
+        # 初期マウント先はトップの ALL VIEW ホスト
+        self._mount_all_view_into(self.all_view_host_main)
+
+        # トップ階層タブの切替で、ALL VIEW のマウント先と共有カメラを反映
         self.top_subtabs.currentChanged.connect(self._on_top_subtab_changed)
 
         layout.addWidget(self.top_subtabs)
@@ -616,8 +625,6 @@ class Tab2Widget(QWidget):
                     self._render_all_view(widget, reset_view=False)
                 else:
                     self._reset_plotter_placeholder(widget.plotter, 'STL(base) を読み込んでください')
-            elif view_kind == 'all_view_mirror':
-                self._render_all_view_mirror(widget)
             elif view_kind == 'posture':
                 if getattr(widget, 'current_mesh', None) is not None:
                     self._render_posture1_plotter(widget, reset_view=False)
@@ -964,6 +971,9 @@ class Tab2Widget(QWidget):
             widget.load_btn.setEnabled(True)
             widget.clear_stl_btn.setEnabled(True)
             self._save_posture_cache(widget)
+            # base STL を各軸の base 姿勢へ反映し、同期照明も更新
+            self._propagate_base_mesh_to_poses()
+            self._refresh_all_lighting()
 
         def _on_load_error(msg: str):
             widget.log_view.append(msg)
@@ -1129,8 +1139,8 @@ class Tab2Widget(QWidget):
         widget.clear_stl_btn.setEnabled(False)
         widget.log_view.append('STLを消去しました。')
         self._save_posture_cache(widget)
-        # base が消えたのでミラーと同期照明も更新
-        self._sync_all_view_mirrors()
+        # base が消えたので base 姿勢と同期照明も更新
+        self._propagate_base_mesh_to_poses()
         self._refresh_all_lighting()
 
     def _clear_posture_stl(self, posture_widget):
@@ -1157,7 +1167,33 @@ class Tab2Widget(QWidget):
         posture_widget.clear_stl_btn.setEnabled(False)
         posture_widget.log_view.append('STLを消去しました。')
         self._save_posture_cache(posture_widget)
+        self._update_posture_tab_title(posture_widget)
         self._invalidate_motion_for_posture(posture_widget)
+
+    def _update_posture_tab_title(self, posture_widget):
+        """姿勢サブタブのタブ名を「姿勢k（ファイル名）」に更新する。
+        STL 未読込なら基本名（姿勢k）に戻す。base 姿勢は対象外。"""
+        if getattr(posture_widget, 'is_base_pose', False):
+            return
+        base_label = getattr(posture_widget, 'posture_tab_label', None)
+        if not base_label:
+            return
+        axis_letter = getattr(posture_widget, 'axis_letter', None)
+        ad = self.axis_data.get(axis_letter) if axis_letter else None
+        if not ad:
+            return
+        subtabs = ad.get('subtabs')
+        if subtabs is None:
+            return
+        idx = subtabs.indexOf(posture_widget)
+        if idx < 0:
+            return
+        stl_path = getattr(posture_widget, 'stl_path', None)
+        if stl_path:
+            name = os.path.splitext(os.path.basename(stl_path))[0]
+            subtabs.setTabText(idx, f'{base_label}（{name}）')
+        else:
+            subtabs.setTabText(idx, base_label)
 
     def _on_sphere_size_changed(self, widget, value):
         # QSpinBox が値を表示するため、ここでは再描画のみ
@@ -1242,7 +1278,8 @@ class Tab2Widget(QWidget):
         if base_widget is not None:
             base_cw = self._serialize_frame(getattr(base_widget, 'c_world', None))
         state = [{'base_c_world': base_cw}]
-        for p in type(self).POSTURE_LABELS:
+        # base 姿勢（C_*-axis_base）もソースに含める
+        for p in (['base'] + list(type(self).POSTURE_LABELS)):
             pw = posture_widgets.get(p) if posture_widgets else None
             ca = getattr(pw, 'c_axis', None) if pw else None
             cw = getattr(pw, 'c_world', None) if pw else None
@@ -1500,10 +1537,6 @@ class Tab2Widget(QWidget):
         """
         if getattr(widget, 'display_in_world_frame', False):
             return None
-        # ALL VIEW ミラーは本体 ALL VIEW の C_world をそのまま使う
-        if getattr(widget, 'view_kind', None) == 'all_view_mirror':
-            base = getattr(self, 'all_view_widget', None)
-            return getattr(base, 'c_world', None) if base is not None else None
         if getattr(widget, 'use_base_fit', False) and getattr(widget, 'view_kind', None) == 'posture':
             T = self._posture_stl_to_world(widget)
             if T is None:
@@ -1603,25 +1636,72 @@ class Tab2Widget(QWidget):
             except Exception:
                 pass
 
+    def _mount_all_view_into(self, host):
+        """ALL VIEW 本体ウィジェットを host のレイアウトへ付け替える（reparent）。"""
+        av = getattr(self, 'all_view_widget', None)
+        if av is None or host is None:
+            return
+        lay = host.layout()
+        if lay is None:
+            lay = QVBoxLayout(host)
+            lay.setContentsMargins(0, 0, 0, 0)
+        if av.parentWidget() is host:
+            return
+        old = av.parentWidget()
+        if old is not None and old.layout() is not None:
+            old.layout().removeWidget(av)
+        lay.addWidget(av)
+        av.show()
+        # reparent 後は GL サーフェスを更新
+        plotter = getattr(av, 'plotter', None)
+        if plotter is not None:
+            try:
+                plotter.render()
+            except Exception:
+                pass
+
+    def _refresh_all_view_mount(self):
+        """現在表示中のタブに応じて ALL VIEW 本体のマウント先を決める。"""
+        try:
+            idx = self.top_subtabs.currentIndex()
+            tab_name = self.top_subtabs.tabText(idx)
+        except Exception:
+            return
+        target = self.all_view_host_main
+        if tab_name in ('U axis', 'V axis', 'W axis', 'X axis', 'Y axis', 'Z axis'):
+            ad = self.axis_data.get(tab_name[0].lower())
+            if ad:
+                sub = ad['subtabs']
+                host = ad.get('mirror_host')
+                # 現在のサブタブが ALL VIEW ホストなら、そこへマウント
+                if host is not None and sub.widget(sub.currentIndex()) is host:
+                    target = host
+        self._mount_all_view_into(target)
+
     def _active_widget_in_axis(self, axis_letter):
         ad = self.axis_data.get(axis_letter)
         if not ad:
             return None
         subtabs = ad['subtabs']
         idx = subtabs.currentIndex()
-        # サブタブ順は [ALL VIEW ミラー, 姿勢1..5, motion]。
-        # 並びに依存せず、現在表示中のサブタブ widget をそのまま返す。
+        w = None
         try:
-            return subtabs.widget(idx)
+            w = subtabs.widget(idx)
         except Exception:
             return None
+        # ALL VIEW ホスト（本体を差し込むだけの器）なら、本体ウィジェットを返す
+        if w is ad.get('mirror_host'):
+            return self.all_view_widget
+        return w
 
     def _on_axis_subtab_changed(self, axis_letter):
+        self._refresh_all_view_mount()
         widget = self._active_widget_in_axis(axis_letter)
         if widget is not None:
             self._apply_shared_camera_with_render(widget)
 
     def _on_top_subtab_changed(self, index):
+        self._refresh_all_view_mount()
         try:
             tab_name = self.top_subtabs.tabText(index)
         except Exception:
@@ -1874,12 +1954,8 @@ class Tab2Widget(QWidget):
         else:
             widget.check_label.setText('<br>'.join(html_lines))
 
-    def _render_all_view(self, widget, reset_view: bool = False,
-                         render_plotter=None, interactive: bool = True,
-                         force_shared_camera: bool = False):
-        """ALL VIEW の描画。render_plotter を渡すとミラー用に別 plotter へ描画する
-        （データは widget=ALL VIEW 本体から読む）。"""
-        plotter = render_plotter if render_plotter is not None else getattr(widget, 'plotter', None)
+    def _render_all_view(self, widget, reset_view: bool = False):
+        plotter = getattr(widget, 'plotter', None)
         if plotter is None or widget.current_mesh is None:
             return
 
@@ -2085,14 +2161,7 @@ class Tab2Widget(QWidget):
                 except Exception:
                     pass
 
-        if force_shared_camera:
-            # ミラー: 常に共有視点に追従（取れない場合は bounds フィット）
-            if not self._apply_shared_camera_to_plotter(plotter, widget):
-                try:
-                    plotter.reset_camera(bounds=widget.current_mesh.bounds)
-                except Exception:
-                    pass
-        elif reset_view:
+        if reset_view:
             bounds = widget.current_mesh.bounds
             if not self._apply_shared_camera_to_plotter(plotter, widget):
                 plotter.reset_camera(bounds=bounds)
@@ -2102,7 +2171,7 @@ class Tab2Widget(QWidget):
             except Exception:
                 pass
 
-        if interactive and active_plane is not None and active_plane.point_add_enabled:
+        if active_plane is not None and active_plane.point_add_enabled:
             try:
                 plotter.enable_surface_point_picking(
                     callback=lambda point, *_args: self._on_plane_surface_point_picked(active_plane, point),
@@ -2111,73 +2180,11 @@ class Tab2Widget(QWidget):
             except Exception:
                 pass
 
-        if interactive:
-            for pw in widget.plane_widgets:
-                if hasattr(pw, 'point_add_btn'):
-                    pw.point_add_btn.setEnabled(pw.current_mesh is not None)
+        for pw in widget.plane_widgets:
+            if hasattr(pw, 'point_add_btn'):
+                pw.point_add_btn.setEnabled(pw.current_mesh is not None)
 
         plotter.render()
-
-        # 本体 ALL VIEW を描画したら、各軸タブのミラーも同期再描画
-        if render_plotter is None:
-            self._sync_all_view_mirrors()
-
-    def _render_all_view_mirror(self, mirror):
-        """ALL VIEW ミラーを本体と同じ内容で再描画する。"""
-        src = getattr(self, 'all_view_widget', None)
-        plotter = getattr(mirror, 'plotter', None)
-        if plotter is None or not HAS_PYVISTA:
-            return
-        if src is None or getattr(src, 'current_mesh', None) is None:
-            self._reset_plotter_placeholder(plotter, 'ALL VIEW と同期（base STL 未読込）')
-            return
-        self._render_all_view(
-            src, reset_view=False, render_plotter=plotter,
-            interactive=False, force_shared_camera=True,
-        )
-
-    def _sync_all_view_mirrors(self):
-        for mirror in list(getattr(self, 'all_view_mirrors', []) or []):
-            try:
-                self._render_all_view_mirror(mirror)
-            except Exception:
-                pass
-
-    def _create_all_view_mirror_widget(self) -> QWidget:
-        """各軸タブの先頭に置く、ALL VIEW と完全同期する表示専用ミラー。"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(2, 2, 2, 2)
-
-        info = QLabel('ALL VIEW（ミラー：本体 ALL VIEW と同期表示）')
-        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        info.setStyleSheet('font-weight: bold; font-size: 11px; color: #bfe4ff;')
-        layout.addWidget(info)
-
-        if HAS_PYVISTA:
-            plotter = QtInteractor(widget)
-            self._setup_plotter_jp_fonts(plotter)
-            bg, _ = self._load_visual_settings()
-            plotter.set_background(bg, top=self._background_top_color(bg))
-            plotter.add_text('ALL VIEW と同期表示', position='upper_left', font_size=10)
-            self._configure_lights(plotter)
-            view = plotter.interactor
-        else:
-            plotter = None
-            view = QLabel('pyvista / pyvistaqt が未インストール')
-            view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        widget.plotter = plotter
-        widget.view_kind = 'all_view_mirror'
-        widget.display_in_world_frame = False
-        self._attach_camera_observer(widget)
-        layout.addWidget(view, 1)
-
-        self.visual_widgets.append(widget)
-        if not hasattr(self, 'all_view_mirrors'):
-            self.all_view_mirrors = []
-        self.all_view_mirrors.append(widget)
-        return widget
 
     def _create_axis_tab(self, axis_letter: str, joint_type: str = 'rotation') -> QWidget:
         """U/V/W/X/Y/Z 軸の共通タブ作成。
@@ -2196,11 +2203,22 @@ class Tab2Widget(QWidget):
         postures = list(type(self).POSTURE_SPECS)
         posture_widgets = {}
 
-        # 姿勢1 の左に ALL VIEW のミラー（本体と同期）を配置（FE タブには base が無いので作らない）
-        mirror_widget = None
+        # 姿勢1 の左に、ALL VIEW 本体を差し込むためのホスト（空の器）を配置。
+        # FE タブには base が無いので作らない。
+        mirror_host = None
+        base_widget = None
         if not getattr(self, 'fe_mode', False):
-            mirror_widget = self._create_all_view_mirror_widget()
-            posture_subtabs.addTab(mirror_widget, 'ALL VIEW')
+            mirror_host = QWidget()
+            _mh = QVBoxLayout(mirror_host)
+            _mh.setContentsMargins(0, 0, 0, 0)
+            posture_subtabs.addTab(mirror_host, 'ALL VIEW')
+
+            # ALL VIEW の次に「base」姿勢（base STL 上にその軸用の C_*-axis_base を作る）
+            base_widget = self._create_posture_view_widget(
+                'base', '', 'base', axis_letter, is_base_pose=True,
+            )
+            posture_widgets['base'] = base_widget
+            posture_subtabs.addTab(base_widget, 'base')
 
         for posture_label, example_text, posture_key in postures:
             posture_widget = self._create_posture_view_widget(
@@ -2209,7 +2227,7 @@ class Tab2Widget(QWidget):
             posture_widgets[posture_label] = posture_widget
             posture_subtabs.addTab(posture_widget, posture_label)
 
-        # 姿勢3 の次に「X軸回転軸 / 並進軸」タブを追加（姿勢表示切替は全軸で有効化）
+        # 末尾に「X軸回転軸 / 並進軸」タブを追加（姿勢表示切替は全軸で有効化）
         motion_widget = self._create_motion_axis_tab(
             axis_letter, posture_widgets, joint_type=joint_type,
             enable_posture_controls=True,
@@ -2223,7 +2241,8 @@ class Tab2Widget(QWidget):
             'subtabs': posture_subtabs,
             'posture_widgets': posture_widgets,
             'motion_widget': motion_widget,
-            'mirror_widget': mirror_widget,
+            'mirror_host': mirror_host,
+            'base_widget': base_widget,
             'joint_type': joint_type,
         }
 
@@ -2613,9 +2632,12 @@ class Tab2Widget(QWidget):
             base_T_world[:3, :3] = R_w_T
             base_T_world[:3, 3] = -R_w_T @ O_w
 
-        # 寛容な入力検証: 有効な姿勢を抽出
+        # 寛容な入力検証: 有効な姿勢を抽出（新方式では base も 1 個の姿勢として含める）
+        candidate_labels = list(all_postures)
+        if use_base_fit and 'base' in posture_widgets:
+            candidate_labels = ['base'] + candidate_labels
         valid = []  # list of (posture_label, posture_widget)
-        for p in all_postures:
+        for p in candidate_labels:
             pw = posture_widgets.get(p)
             if pw is None:
                 continue
@@ -2680,8 +2702,8 @@ class Tab2Widget(QWidget):
 
         N = len(valid)
         pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
-        # ラベル用に元の姿勢番号も持っておく（valid のインデックス → 「姿勢k」の k を取得）
-        posture_nums = [int(p.replace('姿勢', '')) for p, _ in valid]
+        # ログ表示用のラベル（'base' / '姿勢k'）
+        pose_labels = [p for p, _ in valid]
 
         # 全ペアの R_ij と Δ_ij
         R_pairs = []
@@ -2754,10 +2776,10 @@ class Tab2Widget(QWidget):
 
             log.append(f'{motion_name} を計算しました（C_world 座標系上, {N} 姿勢, {len(pairs)} ペア）:')
             for k, (i, j) in enumerate(pairs):
-                ni, nj = posture_nums[i], posture_nums[j]
+                li, lj = pose_labels[i], pose_labels[j]
                 ax = axes_signed[k]
                 log.append(
-                    f'  姿勢{ni}→{nj}: 回転角 = {np.degrees(theta_list[k]):.3f}°, '
+                    f'  {li}→{lj}: 回転角 = {np.degrees(theta_list[k]):.3f}°, '
                     f'軸 = ({ax[0]:+.4f}, {ax[1]:+.4f}, {ax[2]:+.4f})'
                 )
             log.append('  --- 統合結果 ---')
@@ -2765,8 +2787,8 @@ class Tab2Widget(QWidget):
             log.append(f'  軸が通る点 (C_world)   = ({p_axis[0]:+.4f}, {p_axis[1]:+.4f}, {p_axis[2]:+.4f})')
             log.append('  --- 平均方向からの各候補の方向ずれ（理想 0°） ---')
             for k, (i, j) in enumerate(pairs):
-                ni, nj = posture_nums[i], posture_nums[j]
-                log.append(f'    ∠(姿勢{ni}→{nj}, 平均) = {_deg(axes_signed[k], avg_dir):.3f}°')
+                li, lj = pose_labels[i], pose_labels[j]
+                log.append(f'    ∠({li}→{lj}, 平均) = {_deg(axes_signed[k], avg_dir):.3f}°')
         else:  # translation
             # 並進方向の符号合わせ（最初の Δ を基準）
             ref = d_list[0].copy()
@@ -2814,12 +2836,12 @@ class Tab2Widget(QWidget):
                     f'    [{R[2, 0]:+.6f}, {R[2, 1]:+.6f}, {R[2, 2]:+.6f}]',
                 ]
             for k, (i, j) in enumerate(pairs):
-                ni, nj = posture_nums[i], posture_nums[j]
+                li, lj = pose_labels[i], pose_labels[j]
                 R_ij = R_pairs[k]
                 th_ij = theta_list[k]
                 dvec = d_list[k]
-                tag = f'{ni}_{nj}'
-                log.append(f'  --- 姿勢{ni}→{nj} ---')
+                tag = f'{li}_{lj}'
+                log.append(f'  --- {li}→{lj} ---')
                 log.append(f'    R_{tag} (回転角 = {np.degrees(th_ij):.4f}°, 理想 0°):')
                 for ln in _fmt_R(R_ij):
                     log.append(ln)
@@ -2831,9 +2853,9 @@ class Tab2Widget(QWidget):
 
             log.append('  --- 統合結果 ---')
             log.append(f'  {motion_name} 方向 = ({avg_dir[0]:+.6f}, {avg_dir[1]:+.6f}, {avg_dir[2]:+.6f})')
-            first_p = posture_nums[0]
+            first_label = pose_labels[0]
             log.append(
-                f'  軸が通る点 (C_world, 姿勢{first_p} 原点) '
+                f'  軸が通る点 (C_world, {first_label} 原点) '
                 f'= ({p_axis[0]:+.4f}, {p_axis[1]:+.4f}, {p_axis[2]:+.4f})'
             )
             log.append('  --- 平均方向からの各候補の方向ずれ（理想 0°） ---')
@@ -2910,6 +2932,7 @@ class Tab2Widget(QWidget):
             postures = all_postures[: len(T_list)]
         # 姿勢ごとに異なる淡い色で重ねる（5 姿勢まで）
         stl_colors = {
+            'base': '#c0c4cc',  # 灰（基準）
             '姿勢1': '#ffc070',  # 橙
             '姿勢2': '#80d0a0',  # 緑
             '姿勢3': '#a0a0ff',  # 紫
@@ -2931,38 +2954,28 @@ class Tab2Widget(QWidget):
                 min(bnds[4], b[4]), max(bnds[5], b[5]),
             ]
 
-        # 新方式: base STL を C_world 上に重ねて表示（全姿勢が揃う基準）
-        if rot.get('use_base_fit') and rot.get('base_T_world') is not None:
-            base_widget = getattr(self, 'all_view_widget', None)
-            base_mesh = getattr(base_widget, 'current_mesh', None) if base_widget else None
-            if base_mesh is not None and getattr(widget, 'show_base_stl', True):
-                try:
-                    bm = base_mesh.copy()
-                    bm.transform(np.asarray(rot['base_T_world'], dtype=float), inplace=True)
-                    bounds_all = _accumulate_bounds(bounds_all, bm.bounds)
-                    plotter.add_mesh(
-                        bm, name='rot_stl_base', color='#c0c4cc',
-                        opacity=float(getattr(widget, 'base_stl_opacity', 0.35)),
-                        show_edges=False, smooth_shading=True,
-                        ambient=0.15, diffuse=0.75, specular=0.2,
-                        specular_power=20.0, pickable=False,
-                    )
-                except Exception:
-                    pass
-
         for p, T in zip(postures, T_list):
-            pw = posture_widgets[p]
+            pw = posture_widgets.get(p)
+            if pw is None or getattr(pw, 'current_mesh', None) is None:
+                continue
             mesh = pw.current_mesh.copy()
             mesh.transform(T, inplace=True)
             b = mesh.bounds
             # 非表示でも bounds は更新（カメラ安定化のため）
             bounds_all = _accumulate_bounds(bounds_all, b)
 
-            if not stl_visibility.get(p, True):
+            # base 姿勢の可視は show_base_stl トグルに連動
+            if p == 'base':
+                if not getattr(widget, 'show_base_stl', True):
+                    continue
+            elif not stl_visibility.get(p, True):
                 continue
 
-            opacity = widget.sliders[p][0].value() / 100.0
-            color = unified_model_color if unify_color else stl_colors[p]
+            if p in widget.sliders:
+                opacity = widget.sliders[p][0].value() / 100.0
+            else:
+                opacity = float(getattr(widget, 'base_stl_opacity', 0.35))
+            color = unified_model_color if unify_color else stl_colors.get(p, '#c0c4cc')
             try:
                 plotter.add_mesh(
                     mesh,
@@ -3156,14 +3169,16 @@ class Tab2Widget(QWidget):
         widget.point_add_enabled = False
         return widget
 
-    def _create_posture_view_widget(self, posture_label: str, example_text: str, posture_key: str, axis_letter: str = 'u') -> QWidget:
+    def _create_posture_view_widget(self, posture_label: str, example_text: str, posture_key: str, axis_letter: str = 'u', is_base_pose: bool = False) -> QWidget:
         widget = DnDWidget()
         widget.posture_key = posture_key
         widget.axis_letter = axis_letter
+        widget.is_base_pose = is_base_pose
+        widget.posture_tab_label = posture_label  # サブタブの基本名（例 '姿勢1'）
         # 新方式（base へのフィッティングで重ね合わせ）を使うか
         use_base_fit = self._uses_base_fitting(axis_letter)
         widget.use_base_fit = use_base_fit
-        # 例: 'C_u-axis_posi1', 'C_v-axis_posi1', 'C_w-axis_posi1'
+        # 例: 'C_u-axis_posi1' / base 姿勢は 'C_u-axis_base'
         widget.c_axis_name = f'C_{axis_letter}-axis_{posture_key.replace("posture", "posi")}'
         widget.c_axis_label_prefix = f'C_{axis_letter}-axis'  # 例 'C_u-axis'
         main_layout = QVBoxLayout(widget)
@@ -3176,22 +3191,34 @@ class Tab2Widget(QWidget):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(4, 4, 4, 4)
 
-        title = QLabel(f'{posture_label}  {example_text}')
+        if is_base_pose:
+            title = QLabel('base 姿勢（ALL VIEW の base STL を使用）')
+        else:
+            title = QLabel(f'{posture_label}  {example_text}')
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet('font-weight: bold; font-size: 12px;')
         left_layout.addWidget(title)
 
+        # base 姿勢は ALL VIEW の base STL を共用するため、STL 読込/領域/フィッティング UI は持たない
         load_btn = QPushButton('STLを読み込む')
-        left_layout.addWidget(load_btn)
-
         clear_stl_btn = QPushButton('読み込んだSTLを消去')
         clear_stl_btn.setEnabled(False)
-        left_layout.addWidget(clear_stl_btn)
+        if not is_base_pose:
+            left_layout.addWidget(load_btn)
+            left_layout.addWidget(clear_stl_btn)
+        else:
+            load_btn.hide()
+            clear_stl_btn.hide()
+            note = QLabel('※ base STL は ALL VIEW タブで読み込みます。\nここではその軸用の C_*-axis_base を平面1/2/3で作成します。')
+            note.setWordWrap(True)
+            note.setStyleSheet('color: #9fb; font-size: 10px;')
+            left_layout.addWidget(note)
 
-        # === 任意領域 STL の読み込み + base へのフィッティング（新方式: U軸のみ）===
+        # === 任意領域 STL の読み込み + base へのフィッティング（新方式: base 姿勢以外）===
         widget.region_mesh = None
         widget.region_stl_path = None
-        widget.fit_transform = None      # 4x4 (この姿勢の STL 座標 → base STL 座標)
+        # base 姿勢の fit は恒等（base STL = base STL）
+        widget.fit_transform = np.eye(4) if is_base_pose else None
         widget.fit_result = None         # フィッティング統計
         load_region_btn = QPushButton('任意領域のSTLを読み込む')
         fit_btn = QPushButton('任意領域をSTL(base)の任意領域にフィッティング')
@@ -3199,7 +3226,7 @@ class Tab2Widget(QWidget):
         widget.load_region_btn = load_region_btn
         widget.fit_btn = fit_btn
         widget.fit_check_btn = fit_check_btn
-        if use_base_fit:
+        if use_base_fit and not is_base_pose:
             left_layout.addWidget(load_region_btn)
             clear_region_btn = QPushButton('任意領域のSTLを消去')
             clear_region_btn.setEnabled(False)
@@ -3611,6 +3638,7 @@ class Tab2Widget(QWidget):
             widget.load_btn.setEnabled(True)
             widget.clear_stl_btn.setEnabled(True)
             self._save_posture_cache(widget)
+            self._update_posture_tab_title(widget)
             if getattr(widget, 'use_base_fit', False):
                 self._update_fit_button_state(widget)
             # 新規 STL ロード（非 preserve）はソース変更 → motion-axis を無効化
@@ -3631,7 +3659,7 @@ class Tab2Widget(QWidget):
         build_world_btn.clicked.connect(lambda: self._build_c_world_axis(widget))
         clear_world_btn.clicked.connect(lambda: self._clear_c_world_axis(widget))
 
-        if use_base_fit:
+        if use_base_fit and not is_base_pose:
             load_region_btn.clicked.connect(lambda: self._open_region_file(widget))
             widget.clear_region_btn.clicked.connect(lambda: self._clear_region_stl(widget))
             fit_btn.clicked.connect(lambda: self._run_fit(widget))
@@ -3680,28 +3708,42 @@ class Tab2Widget(QWidget):
         widget._on_plane_subtab_changed = _on_plane_subtab_changed
         plane_subtabs.currentChanged.connect(_on_plane_subtab_changed)
 
-        # キャッシュ（点群・C_u-axis・STLパス）を復元。STL があれば自動読込。
+        # キャッシュ（点群・C_axis・STLパス）を復元。STL があれば自動読込。
         widget.stl_path = None
         cached_stl_path = self._load_posture_cache(widget)
         for plane_widget in plane_widgets:
             plane_widget._refresh_point_list()
-        if cached_stl_path and os.path.exists(cached_stl_path):
-            widget.log_view.append(f'キャッシュ検出: {cached_stl_path}')
-            widget._start_load(cached_stl_path, preserve_state=True)
-        elif cached_stl_path:
-            widget.log_view.append(f'前回のSTLが見つかりません: {cached_stl_path}')
+        if is_base_pose:
+            # base 姿勢は ALL VIEW の base STL を共用。fit は恒等で固定。
+            widget.fit_transform = np.eye(4)
+            base = getattr(self, 'all_view_widget', None)
+            base_mesh = getattr(base, 'current_mesh', None) if base else None
+            if base_mesh is not None:
+                widget.current_mesh = base_mesh
+                for pw in widget.plane_widgets:
+                    pw.current_mesh = base_mesh
+                widget.build_axis_btn.setEnabled(True)
+                self._render_posture1_plotter(widget, reset_view=True)
+            else:
+                self._reset_plotter_placeholder(widget.plotter, 'ALL VIEW で base STL を読み込んでください')
+        else:
+            if cached_stl_path and os.path.exists(cached_stl_path):
+                widget.log_view.append(f'キャッシュ検出: {cached_stl_path}')
+                widget._start_load(cached_stl_path, preserve_state=True)
+            elif cached_stl_path:
+                widget.log_view.append(f'前回のSTLが見つかりません: {cached_stl_path}')
 
-        # 任意領域 STL のキャッシュを復元（新方式のみ）
-        if use_base_fit:
-            region_path = getattr(widget, 'region_stl_path', None)
-            if region_path and os.path.exists(region_path):
-                widget.log_view.append(f'任意領域キャッシュ検出: {region_path}')
-                self._load_region_stl(widget, region_path, from_cache=True)
-            elif region_path:
-                widget.log_view.append(f'前回の任意領域STLが見つかりません: {region_path}')
-                widget.region_stl_path = None
-            self._update_fit_status_label(widget)
-            self._update_fit_button_state(widget)
+            # 任意領域 STL のキャッシュを復元（新方式のみ）
+            if use_base_fit:
+                region_path = getattr(widget, 'region_stl_path', None)
+                if region_path and os.path.exists(region_path):
+                    widget.log_view.append(f'任意領域キャッシュ検出: {region_path}')
+                    self._load_region_stl(widget, region_path, from_cache=True)
+                elif region_path:
+                    widget.log_view.append(f'前回の任意領域STLが見つかりません: {region_path}')
+                    widget.region_stl_path = None
+                self._update_fit_status_label(widget)
+                self._update_fit_button_state(widget)
 
         return widget
 
@@ -4729,6 +4771,27 @@ class Tab2Widget(QWidget):
         if base is None:
             return None
         return getattr(base, 'region_mesh', None)
+
+    def _propagate_base_mesh_to_poses(self):
+        """ALL VIEW の base STL を、各軸の base 姿勢タブへ反映して再描画する。"""
+        base = getattr(self, 'all_view_widget', None)
+        mesh = getattr(base, 'current_mesh', None) if base else None
+        for ad in self.axis_data.values():
+            bw = ad.get('base_widget')
+            if bw is None:
+                continue
+            bw.current_mesh = mesh
+            for pw in getattr(bw, 'plane_widgets', []):
+                pw.current_mesh = mesh
+            if mesh is not None:
+                bw.fit_transform = np.eye(4)
+                bw.build_axis_btn.setEnabled(True)
+                self._render_posture1_plotter(bw, reset_view=True)
+            else:
+                bw.build_axis_btn.setEnabled(False)
+                self._reset_plotter_placeholder(bw.plotter, 'ALL VIEW で base STL を読み込んでください')
+            # base 姿勢の mesh 変化は motion を無効化
+            self._invalidate_motion_for_posture(bw)
 
     def _refresh_all_fit_buttons(self):
         """全姿勢のフィッティングボタン状態を更新（base 領域の有無が変わったとき用）。"""
