@@ -751,6 +751,21 @@ class Tab2Widget(QWidget):
             vis_layout.addLayout(row)
             axis_checkboxes[name] = cb_main
             axis_arrow_checkboxes[name] = cb_arrow
+
+        # W平面（C_world 用の 3 平面）の表示/非表示
+        wplane_cb = QCheckBox('W平面（C_world用 3平面）を表示')
+        wplane_cb.setChecked(True)
+        wplane_cb.setStyleSheet('color: #d040d0; font-weight: bold;')
+        vis_layout.addWidget(wplane_cb)
+        widget.show_w_planes = True
+        widget.wplane_checkbox = wplane_cb
+
+        def _on_wplane_toggled(checked, w=widget):
+            w.show_w_planes = bool(checked)
+            if getattr(w, 'current_mesh', None) is not None:
+                self._render_all_view(w, reset_view=False)
+        wplane_cb.toggled.connect(_on_wplane_toggled)
+
         left_layout.addWidget(visibility_group)
 
         # === 検討事項 グループ ===
@@ -1951,6 +1966,41 @@ class Tab2Widget(QWidget):
                         f'(90°との差 {dev:.4f}°)'
                     )
 
+        # --- 直動 ↔ 回転 の比較（理想: 平行 = 0°）---
+        # X↔U, Y↔V, Z↔W のペアで方向ベクトルのなす角を表示
+        rot_by_name = {ax['name']: ax for ax in rot_axes}
+        par_by_name = {ax['name']: ax for ax in par_axes}
+        compare_pairs = [
+            ('X_parallel-axis', 'U_rotation-axis'),
+            ('Y_parallel-axis', 'V_rotation-axis'),
+            ('Z_parallel-axis', 'W_rotation-axis'),
+        ]
+        compare_lines = []
+        for par_name, rot_name in compare_pairs:
+            pa = par_by_name.get(par_name)
+            ra = rot_by_name.get(rot_name)
+            if pa is None or ra is None:
+                continue
+            d1 = np.asarray(pa['direction'], dtype=float)
+            d2 = np.asarray(ra['direction'], dtype=float)
+            n1n = float(np.linalg.norm(d1)); n2n = float(np.linalg.norm(d2))
+            if n1n < 1e-9 or n2n < 1e-9:
+                continue
+            d1 /= n1n; d2 /= n2n
+            cos_th = float(np.clip(abs(np.dot(d1, d2)), -1.0, 1.0))  # 符号反転も平行扱い
+            angle = float(np.degrees(np.arccos(cos_th)))
+            color = '#90ee90' if angle < 1.0 else '#ffa07a'
+            compare_lines.append(
+                f'　　• {par_name} ↔ {rot_name}: '
+                f'<span style="color:{color}">{angle:.4f}°</span>'
+                f' (平行との差 {angle:.4f}°)'
+            )
+        if compare_lines:
+            if html_lines:
+                html_lines.append('')
+            html_lines.append('<b>■ 直動 ↔ 回転 の比較（理想: 平行 = 0°）</b>')
+            html_lines.extend(compare_lines)
+
         if not html_lines:
             widget.check_label.setText('（軸を取り込むと結果がここに表示されます）')
         else:
@@ -1995,17 +2045,19 @@ class Tab2Widget(QWidget):
             'W平面2（YZ平面）': '#00d4d4',
             'W平面3（ZX平面）': '#d040d0',
         }
-        for plane_label, points in widget.shared_world_points.items():
-            if not points:
-                continue
-            arr = np.array(points, dtype=float)
-            plotter.add_mesh(
-                pv.PolyData(arr),
-                name=f'plane_points::{plane_label}',
-                color=plane_colors.get(plane_label, '#ffffff'),
-                point_size=12, render_points_as_spheres=True, style='points',
-                pickable=False, reset_camera=False, render=False,
-            )
+        show_wp = bool(getattr(widget, 'show_w_planes', True))
+        if show_wp:
+            for plane_label, points in widget.shared_world_points.items():
+                if not points:
+                    continue
+                arr = np.array(points, dtype=float)
+                plotter.add_mesh(
+                    pv.PolyData(arr),
+                    name=f'plane_points::{plane_label}',
+                    color=plane_colors.get(plane_label, '#ffffff'),
+                    point_size=12, render_points_as_spheres=True, style='points',
+                    pickable=False, reset_camera=False, render=False,
+                )
 
         # アクティブ平面の選択ハイライト
         active_index = getattr(widget, 'active_plane_index', 0)
@@ -2025,7 +2077,8 @@ class Tab2Widget(QWidget):
                 )
 
         # 平面サーフェス（半透明）
-        for plane_label, points in widget.shared_world_points.items():
+        if show_wp:
+          for plane_label, points in widget.shared_world_points.items():
             if not points or len(points) < 3:
                 continue
             try:
@@ -2368,6 +2421,20 @@ class Tab2Widget(QWidget):
         opacity_group = QGroupBox('STL 透明度')
         opacity_layout = QVBoxLayout(opacity_group)
 
+        # 一括変更ボタン（全姿勢に同じ値を設定）
+        bulk_row = QHBoxLayout()
+        bulk_lbl = QLabel('一括:')
+        bulk_lbl.setMinimumWidth(48)
+        bulk_row.addWidget(bulk_lbl)
+        bulk_btns = []
+        for v in (0, 50, 100):
+            b = QPushButton(f'{v}')
+            b.setMaximumWidth(46)
+            bulk_btns.append((v, b))
+            bulk_row.addWidget(b)
+        bulk_row.addStretch()
+        opacity_layout.addLayout(bulk_row)
+
         sliders = {}
         for posture_label in type(self).POSTURE_LABELS:
             default_val = 50
@@ -2388,8 +2455,18 @@ class Tab2Widget(QWidget):
             row.addWidget(lbl)
             row.addWidget(slider, 1)
             row.addWidget(spin)
+            # 個別のクイック設定ボタン 0/50/100
+            for v in (0, 50, 100):
+                qb = QPushButton(f'{v}')
+                qb.setMaximumWidth(36)
+                qb.clicked.connect(lambda _c, s=slider, val=v: s.setValue(val))
+                row.addWidget(qb)
             opacity_layout.addLayout(row)
             sliders[posture_label] = (slider, spin)
+
+        # 一括ボタンは sliders 確定後に接続
+        for v, b in bulk_btns:
+            b.clicked.connect(lambda _c, val=v: [s[0].setValue(val) for s in sliders.values()])
 
         left_layout.addWidget(opacity_group)
 
@@ -2607,9 +2684,21 @@ class Tab2Widget(QWidget):
         ]) / (2.0 * np.sin(theta))
         return theta, axis
 
+    def _abort_motion_compute(self, widget):
+        """compute の失敗時: needs_update を下げ、結果をクリアして 3D ペインを再描画。
+        これがないと「更新が必要です」の表示が残り続けてしまう。"""
+        widget.needs_update = False
+        widget.motion_axis = None
+        try:
+            self._render_motion_view(widget)
+        except Exception:
+            pass
+
     def _compute_motion_axis(self, widget):
         log = widget.log_view
         log.setText('')
+        # ユーザーが「計算 / 表示更新」を押した時点で stale フラグは下げる。
+        widget.needs_update = False
 
         axis_letter = getattr(widget, 'axis_letter', 'u')
         joint_type = getattr(widget, 'joint_type', 'rotation')
@@ -2625,6 +2714,7 @@ class Tab2Widget(QWidget):
         if use_base_fit:
             if base_widget is None or getattr(base_widget, 'c_world', None) is None:
                 log.append('ALL VIEW で C_world 座標系が未生成です。先に base STL の C_world を生成してください。')
+                self._abort_motion_compute(widget)
                 return
             cw = base_widget.c_world
             R_w = np.column_stack([cw['ex'], cw['ey'], cw['ez']])
@@ -2696,6 +2786,7 @@ class Tab2Widget(QWidget):
                 log.append('有効な姿勢が 2 つ以上ありません。base STL（C_world）と、各姿勢で固定部・アームの2フィットをご準備ください。')
             else:
                 log.append('有効な姿勢が 2 つ以上ありません。各姿勢で STL 読込・C_local・C_world をご準備ください。')
+            self._abort_motion_compute(widget)
             return
 
         log.append(f'有効な姿勢: {", ".join(v[0] for v in valid)} （計 {len(valid)} 個）')
@@ -2769,6 +2860,7 @@ class Tab2Widget(QWidget):
             weights = np.array(theta_list, dtype=float)
             if weights.sum() < 1e-9:
                 log.append('全ペアの回転角がほぼゼロです。回転軸を確定できません。')
+                self._abort_motion_compute(widget)
                 return
             avg_dir = np.zeros(3)
             for w, a in zip(weights, axes_signed):
@@ -2776,6 +2868,7 @@ class Tab2Widget(QWidget):
             n_avg = np.linalg.norm(avg_dir)
             if n_avg < 1e-9:
                 log.append('回転軸の平均方向がゼロです。回転軸を確定できません。')
+                self._abort_motion_compute(widget)
                 return
             avg_dir = avg_dir / n_avg
 
@@ -2792,6 +2885,7 @@ class Tab2Widget(QWidget):
                 p_axis, _r, _rk, _sv = np.linalg.lstsq(A, b, rcond=None)
             except np.linalg.LinAlgError:
                 log.append('回転軸の位置を解けませんでした。')
+                self._abort_motion_compute(widget)
                 return
             p_axis = p_axis - np.dot(p_axis, avg_dir) * avg_dir
 
@@ -2834,6 +2928,7 @@ class Tab2Widget(QWidget):
             lens = np.array([np.linalg.norm(d) for d in d_signed], dtype=float)
             if lens.sum() < 1e-9:
                 log.append('全ペアの並進距離がほぼゼロです。並進軸を確定できません。')
+                self._abort_motion_compute(widget)
                 return
             avg_dir = np.zeros(3)
             for l, d in zip(lens, d_signed):
@@ -2841,6 +2936,7 @@ class Tab2Widget(QWidget):
             n_avg = np.linalg.norm(avg_dir)
             if n_avg < 1e-9:
                 log.append('並進軸の平均方向がゼロです。')
+                self._abort_motion_compute(widget)
                 return
             avg_dir = avg_dir / n_avg
 
@@ -2892,8 +2988,8 @@ class Tab2Widget(QWidget):
             )
             log.append('  --- 平均方向からの各候補の方向ずれ（理想 0°） ---')
             for k, (i, j) in enumerate(pairs):
-                ni, nj = posture_nums[i], posture_nums[j]
-                log.append(f'    ∠(Δ_{ni}_{nj}, 平均) = {_deg(d_signed[k], avg_dir):.4f}°')
+                li, lj = pose_labels[i], pose_labels[j]
+                log.append(f'    ∠(Δ_{li}_{lj}, 平均) = {_deg(d_signed[k], avg_dir):.4f}°')
 
         widget.needs_update = False
         self._save_motion_axis_cache(widget)
