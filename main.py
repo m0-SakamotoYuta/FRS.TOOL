@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 	QTabWidget,
 )
 from tabs.tab1 import Tab1Widget
-from tabs.tab2 import Tab2Widget, FEAxisWidget
+from tabs.tab2 import Tab2Widget, FEAxisWidget, InitialPostureCandidatesWidget
 from tabs.tab3 import Tab3Widget
 from tabs.tab4 import Tab4Widget
 from splash import Splash
@@ -25,9 +25,11 @@ class MainWindow(QMainWindow):
 		self.tabs = QTabWidget()
 		self.tab1 = Tab1Widget()
 		self.tab2 = Tab2Widget()
+		self.tab_candidates = InitialPostureCandidatesWidget(self.tab2)
 		self.tab_fe = FEAxisWidget()
 		self.tabs.addTab(self.tab1, '初期姿勢校正Ver. 1（色変更）')
 		self.tabs.addTab(self.tab2, '初期姿勢校正Ver. 2（実用）')
+		self.tabs.addTab(self.tab_candidates, '初期姿勢候補')
 		self.tabs.addTab(self.tab_fe, '呂')
 		self.tabs.addTab(Tab3Widget(), 'KKR graph')
 		self.tabs.addTab(Tab4Widget(), '設定')
