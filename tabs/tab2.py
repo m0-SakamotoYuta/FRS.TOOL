@@ -776,7 +776,7 @@ class Tab2Widget(QWidget):
             cb_main.setChecked(True)
             cb_main.setStyleSheet(f'color: {color}; font-weight: bold;')
             cb_arrow = QCheckBox()
-            cb_arrow.setChecked(True)
+            cb_arrow.setChecked(False)
             row.addWidget(cb_main, 1)
             row.addWidget(cb_arrow)
             vis_layout.addLayout(row)
@@ -785,10 +785,10 @@ class Tab2Widget(QWidget):
 
         # W平面（C_world 用の 3 平面）の表示/非表示
         wplane_cb = QCheckBox('W平面（C_world用 3平面）を表示')
-        wplane_cb.setChecked(True)
+        wplane_cb.setChecked(False)
         wplane_cb.setStyleSheet('color: #d040d0; font-weight: bold;')
         vis_layout.addWidget(wplane_cb)
-        widget.show_w_planes = True
+        widget.show_w_planes = False
         widget.wplane_checkbox = wplane_cb
 
         def _on_wplane_toggled(checked, w=widget):
@@ -796,6 +796,34 @@ class Tab2Widget(QWidget):
             if getattr(w, 'current_mesh', None) is not None:
                 self._render_all_view(w, reset_view=False)
         wplane_cb.toggled.connect(_on_wplane_toggled)
+
+        # C_world（X赤/Y青/Z緑 の3軸矢印＋原点＋ラベル）の表示/非表示
+        cworld_cb = QCheckBox('C_world を表示')
+        cworld_cb.setChecked(True)
+        cworld_cb.setStyleSheet('color: #80c0ff; font-weight: bold;')
+        vis_layout.addWidget(cworld_cb)
+        widget.show_cworld = True
+        widget.cworld_checkbox = cworld_cb
+
+        def _on_cworld_toggled(checked, w=widget):
+            w.show_cworld = bool(checked)
+            if getattr(w, 'current_mesh', None) is not None:
+                self._render_all_view(w, reset_view=False)
+        cworld_cb.toggled.connect(_on_cworld_toggled)
+
+        # キャプション（U_rotation-axis 等の文字ラベル）の表示/非表示
+        captions_cb = QCheckBox('キャプション（軸名ラベル）を表示')
+        captions_cb.setChecked(True)
+        captions_cb.setStyleSheet('color: #ffe060; font-weight: bold;')
+        vis_layout.addWidget(captions_cb)
+        widget.show_captions = True
+        widget.captions_checkbox = captions_cb
+
+        def _on_captions_toggled(checked, w=widget):
+            w.show_captions = bool(checked)
+            if getattr(w, 'current_mesh', None) is not None:
+                self._render_all_view(w, reset_view=False)
+        captions_cb.toggled.connect(_on_captions_toggled)
 
         left_layout.addWidget(visibility_group)
 
@@ -815,10 +843,10 @@ class Tab2Widget(QWidget):
         sphere_size_lbl.setMinimumWidth(80)
         sphere_size_slider = QSlider(Qt.Orientation.Horizontal)
         sphere_size_slider.setRange(1, 300)
-        sphere_size_slider.setValue(50)
+        sphere_size_slider.setValue(1)
         sphere_size_spin = QSpinBox()
         sphere_size_spin.setRange(1, 300)
-        sphere_size_spin.setValue(50)
+        sphere_size_spin.setValue(1)
         sphere_size_spin.setSuffix('%')
         sphere_size_spin.setMinimumWidth(80)
         # 双方向同期
@@ -926,7 +954,7 @@ class Tab2Widget(QWidget):
         widget.axis_checkboxes = axis_checkboxes
         widget.axis_arrow_checkboxes = axis_arrow_checkboxes
         widget.axis_visibility = {name: True for name, _ in axis_check_specs}
-        widget.axis_arrow_visibility = {name: True for name, _ in axis_check_specs}
+        widget.axis_arrow_visibility = {name: False for name, _ in axis_check_specs}
         widget.check_label = check_label
         widget.sphere_size_slider = sphere_size_slider
         widget.sphere_size_spin = sphere_size_spin
@@ -1813,7 +1841,8 @@ class Tab2Widget(QWidget):
         return {'name': name, 'color': color, 'direction': d, 'point': p, 'kind': kind}
 
     def _import_axes(self, widget, kind: str):
-        """kind='rotation' なら U/V/W、'translation' なら X/Y/Z を取り込み、分析・描画する。"""
+        """kind='rotation' なら U/V/W、'translation' なら X/Y/Z を取り込み、分析・描画する。
+        取り込み前に各軸タブの『計算 / 表示更新』を自動で実行する。"""
         log = widget.log_view
         log.append('---')
 
@@ -1822,7 +1851,7 @@ class Tab2Widget(QWidget):
             return
 
         if kind == 'rotation':
-            log.append('U/V/W rotation-axis を取り込みます...')
+            log.append('U/V/W rotation-axis を取り込みます（まず各軸タブで計算 → 取り込み）...')
             spec_list = [
                 ('u', 'U_rotation-axis', '#ffd000'),
                 ('v', 'V_rotation-axis', '#00d4d4'),
@@ -1830,13 +1859,26 @@ class Tab2Widget(QWidget):
             ]
             kind_jp = '回転軸'
         else:
-            log.append('X/Y/Z parallel-axis を取り込みます...')
+            log.append('X/Y/Z parallel-axis を取り込みます（まず各軸タブで計算 → 取り込み）...')
             spec_list = [
                 ('x', 'X_parallel-axis', '#ff8040'),
                 ('y', 'Y_parallel-axis', '#80ff40'),
                 ('z', 'Z_parallel-axis', '#4080ff'),
             ]
             kind_jp = '並進軸'
+
+        # 先に各軸タブの『{kind_jp}を計算 / 表示更新』を自動実行する
+        for letter, name, _color in spec_list:
+            ad = self.axis_data.get(letter)
+            mw = ad.get('motion_widget') if ad else None
+            if mw is None:
+                log.append(f'  {name}: motion_widget が無いためスキップ')
+                continue
+            log.append(f'  {name}: {letter.upper()} axis タブで{kind_jp}を計算中...')
+            try:
+                self._compute_motion_axis(mw)
+            except Exception as e:
+                log.append(f'  {name}: 計算中に例外: {e}')
 
         new_axes = []
         for letter, name, color in spec_list:
@@ -1853,6 +1895,12 @@ class Tab2Widget(QWidget):
 
         self._update_check_label(widget)
         self._render_all_view(widget, reset_view=False)
+        # 候補タブ群へ通知（検討事項を再計算）
+        for cb in list(getattr(self, '_on_axes_imported_callbacks', None) or []):
+            try:
+                cb()
+            except Exception:
+                pass
 
     def _analyze_rotation_axes(self, widget, log):
         """rotation_axes の最近接点・距離を計算して widget に格納。"""
@@ -2169,8 +2217,10 @@ class Tab2Widget(QWidget):
 
         # シーン基準長
 
-        # C_world 座標軸（STL 座標系で描画）
-        if widget.c_world is not None:
+        # C_world 座標軸（STL 座標系で描画）— トグルで一括表示/非表示
+        show_cworld = bool(getattr(widget, 'show_cworld', True))
+        show_caps = bool(getattr(widget, 'show_captions', True))
+        if widget.c_world is not None and show_cworld:
             axis_len = max(diag * 0.2, 1.0)
             origin = widget.c_world['origin']
             for suffix, vec, color in (
@@ -2194,19 +2244,20 @@ class Tab2Widget(QWidget):
                 )
             except Exception:
                 pass
-            try:
-                offs = axis_len * 0.10
-                label_pos = np.asarray(origin, dtype=float) + np.array([offs, offs, offs])
-                plotter.add_point_labels(
-                    np.array([label_pos], dtype=float),
-                    ['C_world'],
-                    name='c_world_label',
-                    font_size=14, text_color='#bfe4ff',
-                    point_size=0, shape=None, always_visible=True,
-                    pickable=False, reset_camera=False, render=False,
-                )
-            except Exception:
-                pass
+            if show_caps:
+                try:
+                    offs = axis_len * 0.10
+                    label_pos = np.asarray(origin, dtype=float) + np.array([offs, offs, offs])
+                    plotter.add_point_labels(
+                        np.array([label_pos], dtype=float),
+                        ['C_world'],
+                        name='c_world_label',
+                        font_size=14, text_color='#bfe4ff',
+                        point_size=0, shape=None, always_visible=True,
+                        pickable=False, reset_camera=False, render=False,
+                    )
+                except Exception:
+                    pass
 
         # 取り込み済み回転軸 + 並進軸 を STL 座標系へ変換して描画
         rotation_axes = widget.rotation_axes or []
@@ -2248,19 +2299,20 @@ class Tab2Widget(QWidget):
                                          pickable=False, reset_camera=False, render=False)
                     except Exception:
                         pass
-                try:
-                    label_pos = pt_stl + dir_stl * (diag * 0.40)
-                    label_pos = label_pos + np.array([diag * 0.03, diag * 0.03, diag * 0.03])
-                    plotter.add_point_labels(
-                        np.array([label_pos], dtype=float),
-                        [name],
-                        name=f'axis_{name}_label',
-                        font_size=14, text_color=color,
-                        point_size=0, shape=None, always_visible=True,
-                        pickable=False, reset_camera=False, render=False,
-                    )
-                except Exception:
-                    pass
+                if show_caps:
+                    try:
+                        label_pos = pt_stl + dir_stl * (diag * 0.40)
+                        label_pos = label_pos + np.array([diag * 0.03, diag * 0.03, diag * 0.03])
+                        plotter.add_point_labels(
+                            np.array([label_pos], dtype=float),
+                            [name],
+                            name=f'axis_{name}_label',
+                            font_size=14, text_color=color,
+                            point_size=0, shape=None, always_visible=True,
+                            pickable=False, reset_camera=False, render=False,
+                        )
+                    except Exception:
+                        pass
 
             # 球：rotation 軸の最近接点 / 交点（rotation_axes が 2 本以上の場合のみ）
             if widget.intersection_point is not None and rotation_axes:
@@ -2554,7 +2606,7 @@ class Tab2Widget(QWidget):
         show_line_cb = QCheckBox('軸全体')
         show_line_cb.setChecked(True)
         show_arrow_cb = QCheckBox('矢印')
-        show_arrow_cb.setChecked(True)
+        show_arrow_cb.setChecked(False)
         axis_vis_layout.addWidget(show_line_cb)
         axis_vis_layout.addWidget(show_arrow_cb)
         axis_vis_layout.addStretch()
@@ -2562,7 +2614,7 @@ class Tab2Widget(QWidget):
         widget.show_line_cb = show_line_cb
         widget.show_arrow_cb = show_arrow_cb
         widget.show_axis_line = True
-        widget.show_axis_arrow = True
+        widget.show_axis_arrow = False
         show_line_cb.toggled.connect(
             lambda checked, w=widget: self._on_motion_axis_visibility_toggled(w, 'line', checked)
         )
@@ -5508,6 +5560,10 @@ class InitialPostureCandidatesWidget(QWidget):
         super().__init__(parent)
         self.tab2 = tab2_widget   # Tab2Widget への参照（既存メソッドを流用）
         self.candidates = []      # 候補ウィジェットの並び
+        # Tab2Widget の取り込み完了通知に登録（候補側の検討事項を自動更新）
+        if not hasattr(tab2_widget, '_on_axes_imported_callbacks'):
+            tab2_widget._on_axes_imported_callbacks = []
+        tab2_widget._on_axes_imported_callbacks.append(self.refresh_all_check_labels)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
@@ -5597,6 +5653,25 @@ class InitialPostureCandidatesWidget(QWidget):
             self.tab2._apply_shared_camera_with_render(w)
         except Exception:
             pass
+        # 検討事項を最新状態に更新（ALL VIEW で軸を取り込んだ後、候補に戻った時など）
+        try:
+            self._update_candidate_check_label(w)
+        except Exception:
+            pass
+
+    def refresh_all_check_labels(self):
+        """全候補タブの検討事項を再計算する（ALL VIEW で軸を取り込んだ後など）。"""
+        for i in range(self.subtabs.count()):
+            w = self.subtabs.widget(i)
+            try:
+                self._update_candidate_check_label(w)
+            except Exception:
+                pass
+            try:
+                if getattr(w, 'current_mesh', None) is not None:
+                    self._render_candidate_view(w, reset_view=False)
+            except Exception:
+                pass
 
     # ----- 永続化 -----
     def _save_to_settings(self):
@@ -5625,6 +5700,8 @@ class InitialPostureCandidatesWidget(QWidget):
         d = {'name': name}
         d['stl_path'] = getattr(widget, 'stl_path', None) or None
         d['region_stl_path'] = getattr(widget, 'region_stl_path', None) or None
+        # 軸ごとのアーム領域 STL パス（候補側）
+        d['arm_region_paths'] = dict(getattr(widget, 'arm_region_paths', {}) or {})
         fit_T = getattr(widget, 'fit_transform', None)
         d['fit_transform'] = (np.asarray(fit_T, dtype=float).tolist() if fit_T is not None else None)
         arm = getattr(widget, 'fit_arm_transforms', {}) or {}
@@ -5632,6 +5709,17 @@ class InitialPostureCandidatesWidget(QWidget):
             k: (np.asarray(v, dtype=float).tolist() if v is not None else None)
             for k, v in arm.items()
         }
+        axis_params = {}
+        regen_controls = getattr(widget, 'axis_regen_controls', None)
+        if regen_controls:
+            for L, ctl in regen_controls.items():
+                axis_params[L] = {
+                    'voxel_size': float(ctl['voxel'].value()),
+                    'ransac_iter': int(ctl['ransac_iter'].value()),
+                    'icp_iter': int(ctl['icp_iter'].value()),
+                    'dist_factor': float(ctl['dist_factor'].value()),
+                }
+        d['axis_fit_params'] = axis_params
         d['memo'] = getattr(widget, 'memo_text', '') or ''
         # 軸表示トグル
         d['show_arrows'] = bool(getattr(widget, 'show_arrows', False))
@@ -5647,6 +5735,21 @@ class InitialPostureCandidatesWidget(QWidget):
             k: (np.asarray(v, dtype=float) if v is not None else None)
             for k, v in arm.items()
         }
+        axis_params = state.get('axis_fit_params') or {}
+        regen_controls = getattr(widget, 'axis_regen_controls', None)
+        if regen_controls:
+            for L, params in axis_params.items():
+                ctl = regen_controls.get(L)
+                if not ctl:
+                    continue
+                if 'voxel_size' in params:
+                    ctl['voxel'].setValue(float(params['voxel_size']))
+                if 'ransac_iter' in params:
+                    ctl['ransac_iter'].setValue(int(params['ransac_iter']))
+                if 'icp_iter' in params:
+                    ctl['icp_iter'].setValue(int(params['icp_iter']))
+                if 'dist_factor' in params:
+                    ctl['dist_factor'].setValue(float(params['dist_factor']))
         memo = state.get('memo') or ''
         widget.memo_text = memo
         if hasattr(widget, 'memo_edit'):
@@ -5674,6 +5777,20 @@ class InitialPostureCandidatesWidget(QWidget):
         elif rp:
             widget.log_view.append(f'前回の固定部領域 STL が見つかりません: {rp}')
             widget.region_stl_path = None
+        # 軸ごとのアーム領域 STL を復元
+        arm_paths = state.get('arm_region_paths') or {}
+        for L, p in arm_paths.items():
+            if not p:
+                continue
+            if os.path.exists(p):
+                widget.log_view.append(f'{L.upper()}軸アーム領域 STL 復元: {p}')
+                try:
+                    self._load_axis_arm_region(widget, L, p, from_cache=True)
+                except Exception as e:
+                    widget.log_view.append(f'  {L.upper()}軸領域復元に失敗: {e}')
+            else:
+                widget.log_view.append(f'前回の {L.upper()}軸アーム領域 STL が見つかりません: {p}')
+                widget.arm_region_paths[L] = None
         self._refresh_buttons(widget)
 
     # ----- 候補タブの構築 -----
@@ -5776,12 +5893,52 @@ class InitialPostureCandidatesWidget(QWidget):
         # 各 axis を再生成
         axes_group = QGroupBox('② 各 axis を再生成')
         axes_layout = QVBoxLayout(axes_group)
-        regen_btn = QPushButton('U〜Z 6軸を再生成（baseのアーム領域を新STLにフィット）')
-        regen_btn.setEnabled(False)
-        axes_layout.addWidget(regen_btn)
-        regen_status = QLabel('未実行')
-        regen_status.setWordWrap(True); regen_status.setStyleSheet('color: #cfa; font-size: 11px;')
-        axes_layout.addWidget(regen_status)
+        # 各軸の領域 STL（候補 STL から、その軸の可動部だけ切り出したもの）
+        widget.arm_region_meshes = {L: None for L in type(self).AXIS_LETTERS}
+        widget.arm_region_paths = {L: None for L in type(self).AXIS_LETTERS}
+        axis_tabs = QTabWidget()
+        axes_layout.addWidget(axis_tabs)
+        axis_regen_controls = {}
+        for L in type(self).AXIS_LETTERS:
+            tab = QWidget()
+            tab_layout = QVBoxLayout(tab)
+            # 軸ごとのアーム領域 STL（候補側）読込
+            region_load_btn = QPushButton(f'{L.upper()}軸アーム領域STLを読み込む')
+            region_clear_btn = QPushButton('アーム領域STLを消去')
+            region_clear_btn.setEnabled(False)
+            region_status = QLabel('未読込')
+            region_status.setWordWrap(True)
+            region_status.setStyleSheet('color: #cfa; font-size: 11px;')
+            tab_layout.addWidget(region_load_btn)
+            tab_layout.addWidget(region_clear_btn)
+            tab_layout.addWidget(region_status)
+            params_group = QGroupBox('フィットパラメータ')
+            params_layout = QVBoxLayout(params_group)
+            voxel_spin = _mp(params_layout, 'voxel サイズ:', 0.0, 1000.0, 0.0, decimals=3, suffix=' mm')
+            voxel_spin.setToolTip('0 にすると base の対角長から自動推定します。')
+            ransac_spin = _mp(params_layout, 'RANSAC 反復:', 1000, 10000000, 100000)
+            icp_spin = _mp(params_layout, 'ICP 反復:', 1, 2000, 50)
+            dist_spin = _mp(params_layout, '距離係数(×voxel):', 0.1, 50.0, 1.5, decimals=2)
+            run_btn = QPushButton(f'{L.upper()}軸をフィット')
+            run_btn.setEnabled(False)
+            status = QLabel('未実行')
+            status.setWordWrap(True)
+            status.setStyleSheet('color: #cfa; font-size: 11px;')
+            tab_layout.addWidget(params_group)
+            tab_layout.addWidget(run_btn)
+            tab_layout.addWidget(status)
+            axis_tabs.addTab(tab, L.upper())
+            axis_regen_controls[L] = {
+                'btn': run_btn,
+                'status': status,
+                'voxel': voxel_spin,
+                'ransac_iter': ransac_spin,
+                'icp_iter': icp_spin,
+                'dist_factor': dist_spin,
+                'region_load_btn': region_load_btn,
+                'region_clear_btn': region_clear_btn,
+                'region_status': region_status,
+            }
         # 表示トグル
         toggle_row = QHBoxLayout()
         show_arrows_cb = QCheckBox('矢印を表示')
@@ -5799,11 +5956,14 @@ class InitialPostureCandidatesWidget(QWidget):
             per_axis_row.addWidget(cb)
             per_axis_cbs[L] = cb
         axes_layout.addLayout(per_axis_row)
+        # 「軸を表示」ボタン: 全6軸の表示を ON にして再描画
+        show_axes_btn = QPushButton('軸を表示（全6軸 ON で再描画）')
+        axes_layout.addWidget(show_axes_btn)
+        widget.show_axes_btn = show_axes_btn
         left_layout.addWidget(axes_group)
-        widget.regen_btn = regen_btn
-        widget.regen_status_label = regen_status
         widget.show_arrows_cb = show_arrows_cb
         widget.per_axis_cbs = per_axis_cbs
+        widget.axis_regen_controls = axis_regen_controls
 
         # 視点記録
         view_row = QHBoxLayout()
@@ -5964,8 +6124,15 @@ class InitialPostureCandidatesWidget(QWidget):
         fit_btn.clicked.connect(lambda: tab2._run_fit(widget, slot='world'))
         fit_check_btn.clicked.connect(lambda: tab2._show_fit_result(widget, slot='world'))
 
-        # 各 axis を再生成
-        regen_btn.clicked.connect(lambda: self._run_all_axes_regen(widget))
+        # 各 axis を再生成（個別）＋軸ごとのアーム領域 STL 読込
+        for L, ctl in axis_regen_controls.items():
+            ctl['btn'].clicked.connect(lambda _c, axis=L: self._run_axis_regen(widget, axis))
+            ctl['region_load_btn'].clicked.connect(
+                lambda _c, axis=L: self._open_axis_arm_region(widget, axis)
+            )
+            ctl['region_clear_btn'].clicked.connect(
+                lambda _c, axis=L: self._clear_axis_arm_region(widget, axis)
+            )
 
         # 表示トグル
         def _on_arrow_toggled(checked):
@@ -5981,6 +6148,28 @@ class InitialPostureCandidatesWidget(QWidget):
                 self._save_to_settings()
             cb.toggled.connect(_on_axis_vis_toggled)
 
+        # 「軸を表示」ボタン: 全6軸の表示 ON にして再描画
+        def _on_show_axes_clicked():
+            for L_, cb in per_axis_cbs.items():
+                cb.blockSignals(True)
+                cb.setChecked(True)
+                cb.blockSignals(False)
+                widget.axis_visibility[L_] = True
+            self._render_candidate_view(widget, reset_view=False)
+            self._update_candidate_check_label(widget)
+            self._save_to_settings()
+            # フィット未完了の軸を案内
+            arm = widget.fit_arm_transforms or {}
+            missing = [L_.upper() for L_ in type(self).AXIS_LETTERS if arm.get(L_) is None]
+            if missing:
+                widget.log_view.append(
+                    f'軸表示 ON: {", ".join(missing)} 軸は未フィットのため描画されません。'
+                    f' 該当軸タブで「フィット」を実行してください。'
+                )
+            else:
+                widget.log_view.append('全6軸の表示を ON にして再描画しました。')
+        show_axes_btn.clicked.connect(_on_show_axes_clicked)
+
         # 初期描画
         tab2._reset_plotter_placeholder(widget.plotter, 'STL を読み込んでください')
 
@@ -5995,14 +6184,24 @@ class InitialPostureCandidatesWidget(QWidget):
         widget.fit_check_btn.setEnabled(getattr(widget, 'fit_transform', None) is not None)
         if hasattr(widget, 'clear_region_btn'):
             widget.clear_region_btn.setEnabled(bool(has_region))
-        # 再生成は: 固定部 fit 済み AND 各軸の base に C_*-axis_base + arm 領域 がある
+        # 各軸の再生成: 固定部 fit 済み AND base 側のアーム領域 AND この軸の候補側アーム領域
         has_world_fit = getattr(widget, 'fit_transform', None) is not None
-        has_axes_data = all(
-            getattr(self.tab2.axis_data.get(L, {}).get('base_widget'), 'c_axis', None) is not None
-            and getattr(self.tab2.axis_data.get(L, {}).get('base_widget'), 'region_link_mesh', None) is not None
-            for L in type(self).AXIS_LETTERS
-        )
-        widget.regen_btn.setEnabled(bool(has_world_fit and has_axes_data and HAS_OPEN3D))
+        regen_controls = getattr(widget, 'axis_regen_controls', None)
+        arm_meshes = getattr(widget, 'arm_region_meshes', {}) or {}
+        if regen_controls:
+            for L, ctl in regen_controls.items():
+                bw = self.tab2.axis_data.get(L, {}).get('base_widget')
+                has_axis_data = (
+                    getattr(bw, 'c_axis', None) is not None
+                    and getattr(bw, 'region_link_mesh', None) is not None
+                )
+                has_candidate_arm = arm_meshes.get(L) is not None
+                btn = ctl.get('btn')
+                if btn is not None:
+                    btn.setEnabled(bool(
+                        has_stl and has_world_fit and has_axis_data
+                        and has_candidate_arm and HAS_OPEN3D
+                    ))
 
     def _render_candidate_view(self, widget, reset_view=False):
         """候補タブの 3D ビューを再描画する。STL + 復元した 6 軸 + C_world。"""
@@ -6056,6 +6255,11 @@ class InitialPostureCandidatesWidget(QWidget):
 
         # 6 軸（imported 軸を各 T_arm_new_L で運んだ方向を描画）
         self._draw_imported_axes_on_candidate(widget, plotter, diag)
+        # 描画ごとに検討事項も最新状態に更新（ALL VIEW 側の状態変化に追従するため）
+        try:
+            self._update_candidate_check_label(widget)
+        except Exception:
+            pass
 
         if reset_view:
             if not self.tab2._apply_shared_camera_to_plotter(plotter, widget):
@@ -6253,57 +6457,122 @@ class InitialPostureCandidatesWidget(QWidget):
         self._dialogs.append(dlg)
         dlg.show()
 
-    def _run_all_axes_regen(self, widget):
+    # ----- 候補側の軸別アーム領域 STL -----
+    def _open_axis_arm_region(self, widget, axis_letter: str):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            widget, f'{axis_letter.upper()}軸アーム領域 STL を開く', '', 'STL Files (*.stl)'
+        )
+        if not path:
+            return
+        self._load_axis_arm_region(widget, axis_letter, path, from_cache=False)
+
+    def _load_axis_arm_region(self, widget, axis_letter: str, path: str, from_cache: bool = False):
+        if not HAS_PYVISTA:
+            widget.log_view.append('pyvista が無いため領域を読み込めません。')
+            return
+        try:
+            mesh = self.tab2._read_region_mesh(path)
+        except Exception as e:
+            widget.log_view.append(f'{axis_letter.upper()}軸アーム領域 STL 読込失敗: {e}')
+            return
+        widget.arm_region_meshes[axis_letter] = mesh
+        widget.arm_region_paths[axis_letter] = path
+        widget.log_view.append(
+            f'{axis_letter.upper()}軸アーム領域 STL を読み込みました: {path} (points={mesh.n_points})'
+        )
+        ctl = (getattr(widget, 'axis_regen_controls', {}) or {}).get(axis_letter)
+        if ctl is not None:
+            ctl['region_status'].setText(f'読込済み: {os.path.basename(path)}')
+            ctl['region_clear_btn'].setEnabled(True)
+        if not from_cache:
+            self._save_to_settings()
+        self._refresh_buttons(widget)
+
+    def _clear_axis_arm_region(self, widget, axis_letter: str):
+        widget.arm_region_meshes[axis_letter] = None
+        widget.arm_region_paths[axis_letter] = None
+        widget.log_view.append(f'{axis_letter.upper()}軸アーム領域 STL を消去しました。')
+        ctl = (getattr(widget, 'axis_regen_controls', {}) or {}).get(axis_letter)
+        if ctl is not None:
+            ctl['region_status'].setText('未読込')
+            ctl['region_clear_btn'].setEnabled(False)
+        self._save_to_settings()
+        self._refresh_buttons(widget)
+
+    def _run_axis_regen(self, widget, axis_letter: str):
         if not HAS_OPEN3D:
             widget.log_view.append('open3d が見つかりません。`pip install open3d` を実行してください。')
             return
-        target = widget.current_mesh
+        # target: その軸の候補側アーム領域 STL（候補 STL から抽出した可動部）
+        target = widget.arm_region_meshes.get(axis_letter)
         if target is None:
-            widget.log_view.append('STL が未読込です。')
+            widget.log_view.append(
+                f'{axis_letter.upper()}軸アーム領域 STL が未読込です。'
+                f'まず「{axis_letter.upper()}軸アーム領域STLを読み込む」で抽出済みの可動部 STL を読み込んでください。'
+            )
             return
         if widget.fit_transform is None:
             widget.log_view.append('先に ①固定部(C_world)フィット を実施してください。')
             return
+        ctl = (getattr(widget, 'axis_regen_controls', {}) or {}).get(axis_letter)
+        if not ctl:
+            widget.log_view.append(f'{axis_letter.upper()}: 再生成UIが見つかりません。')
+            return
+        bw = self.tab2.axis_data.get(axis_letter, {}).get('base_widget')
+        src = getattr(bw, 'region_link_mesh', None) if bw else None
+        if src is None:
+            widget.log_view.append(f'{axis_letter.upper()}: base のアーム領域 STL がありません。')
+            return
         params = {
-            'voxel_size': float(widget.fit_voxel_spin.value()),
-            'ransac_iter': int(widget.fit_ransac_iter_spin.value()),
-            'icp_iter': int(widget.fit_icp_iter_spin.value()),
-            'dist_factor': float(widget.fit_dist_spin.value()),
+            'voxel_size': float(ctl['voxel'].value()),
+            'ransac_iter': int(ctl['ransac_iter'].value()),
+            'icp_iter': int(ctl['icp_iter'].value()),
+            'dist_factor': float(ctl['dist_factor'].value()),
         }
-        widget.log_view.append('=== 各 axis 再生成: 開始 ===')
-        widget.regen_btn.setEnabled(False)
-        widget.regen_status_label.setText('実行中…')
+        widget.log_view.append(f'=== {axis_letter.upper()} 軸 再生成: 開始 ===')
+        # 使用 STL を明示的に表示（フィットで「読み込んだSTLが使われていない」誤解を防ぐ）
+        widget.log_view.append(
+            f'  source (base 側 {axis_letter.upper()}軸アーム領域): {src.n_points} 点'
+        )
+        target_path = (getattr(widget, 'arm_region_paths', {}) or {}).get(axis_letter)
+        widget.log_view.append(
+            f'  target (候補側 {axis_letter.upper()}軸アーム領域): {target.n_points} 点'
+            + (f' / {os.path.basename(target_path)}' if target_path else '')
+        )
+        full_pts = widget.current_mesh.n_points if widget.current_mesh is not None else 0
+        widget.log_view.append(
+            f'  （参考: 候補 STL 全体 {full_pts} 点 — フィットには target のみ使用）'
+        )
+        ctl['btn'].setEnabled(False)
+        ctl['status'].setText('実行中…')
         QApplication.processEvents()
-        results = {}
-        for L in type(self).AXIS_LETTERS:
-            bw = self.tab2.axis_data.get(L, {}).get('base_widget')
-            src = getattr(bw, 'region_link_mesh', None) if bw else None
-            if src is None:
-                widget.log_view.append(f'  {L.upper()}: base のアーム領域 STL がありません。スキップ')
-                continue
-            widget.log_view.append(f'--- {L.upper()} 軸: アーム領域フィット ---')
-            QApplication.processEvents()
-            try:
-                res = ransac_icp_fit(
-                    src, target, params,
-                    log=lambda m: widget.log_view.append('  ' + m),
-                )
-            except Exception as e:
-                widget.log_view.append(f'  {L.upper()}: フィット失敗: {e}')
-                continue
-            T = np.asarray(res['transform'], dtype=float)
-            widget.fit_arm_transforms[L] = T
-            results[L] = {'T': T, 'res': res, 'src': src}
-            QApplication.processEvents()
-        widget.regen_btn.setEnabled(True)
-        n_ok = len(results)
-        widget.regen_status_label.setText(f'完了（{n_ok}/{len(type(self).AXIS_LETTERS)} 軸成功）')
-        widget.log_view.append('=== 各 axis 再生成: 完了 ===')
+        try:
+            res = ransac_icp_fit(
+                src, target, params,
+                log=lambda m: widget.log_view.append('  ' + m),
+            )
+        except Exception as e:
+            widget.log_view.append(f'{axis_letter.upper()}: フィット失敗: {e}')
+            ctl['status'].setText('失敗')
+            ctl['btn'].setEnabled(True)
+            return
+        T = np.asarray(res['transform'], dtype=float)
+        widget.fit_arm_transforms[axis_letter] = T
+        ctl['status'].setText(
+            f"フィット済み: ICP fitness={res['icp_fitness']:.3f}, RMSE={res['icp_rmse']:.3f} mm"
+        )
+        ctl['btn'].setEnabled(True)
+        widget.log_view.append(f'=== {axis_letter.upper()} 軸 再生成: 完了 ===')
         self._render_candidate_view(widget, reset_view=False)
         self._update_candidate_check_label(widget)
         self._save_to_settings()
-        if results:
-            self._show_regen_results_dialog(widget, results)
+        self._show_regen_results_dialog(widget, {axis_letter: {'T': T, 'res': res, 'src': src}})
+
+    def _run_all_axes_regen(self, widget):
+        # 互換用: まとめて実行したい場合は個別実行を順に呼ぶ
+        for L in type(self).AXIS_LETTERS:
+            self._run_axis_regen(widget, L)
 
     def _show_regen_results_dialog(self, widget, results):
         """6 軸のフィット結果を 1 ウィンドウ・6 タブで表示。ESC で閉じる。"""
@@ -6313,46 +6582,93 @@ class InitialPostureCandidatesWidget(QWidget):
         from PyQt6.QtGui import QShortcut, QKeySequence
         dlg = QDialog(widget)
         dlg.setWindowTitle('各 axis 再生成結果（ESC で閉じる）')
-        dlg.resize(960, 720)
+        # 画面いっぱいで表示
+        try:
+            scr = QApplication.primaryScreen()
+            if scr is not None:
+                dlg.resize(scr.availableGeometry().size())
+        except Exception:
+            dlg.resize(1200, 900)
         lay = QVBoxLayout(dlg)
         info = QLabel('灰: 候補 STL / 橙: base アーム領域をフィット適用後')
         lay.addWidget(info)
-        tabs = QTabWidget()
-        lay.addWidget(tabs)
-        target = widget.current_mesh
-        for L in type(self).AXIS_LETTERS:
-            item = results.get(L)
-            tab = QWidget()
-            tlay = QVBoxLayout(tab)
-            if item is None:
-                msg = QLabel(f'{L.upper()}: フィット失敗または未実行')
-                msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                tlay.addWidget(msg)
-                tabs.addTab(tab, L.upper())
-                continue
+        plotters = []
+        arm_regions = getattr(widget, 'arm_region_meshes', {}) or {}
+        arm_paths = getattr(widget, 'arm_region_paths', {}) or {}
+
+        def _populate_one(L, item, tlay):
+            """1 軸ぶんの結果プロット。target = 候補側のその軸のアーム領域 STL（実際の fit 相手）。"""
             T = item['T']; res = item['res']; src = item['src']
+            target_arm = arm_regions.get(L)
+            ap = arm_paths.get(L) or '(未読込)'
+            # 使用 STL を明示
+            use_lbl = QLabel(
+                f'使用 STL: source = base 側 {L.upper()}軸アーム領域 ({src.n_points} 点) / '
+                f'target = 候補側 {L.upper()}軸アーム領域 '
+                f'({target_arm.n_points if target_arm is not None else 0} 点) — '
+                f'{os.path.basename(ap) if ap and ap != "(未読込)" else "(未読込)"}'
+            )
+            use_lbl.setWordWrap(True)
+            use_lbl.setStyleSheet('color: #ffe060; font-size: 11px;')
+            tlay.addWidget(use_lbl)
             stat = QLabel(
                 f"RANSAC fitness={res['ransac_fitness']:.4f}, RMSE={res['ransac_rmse']:.4f} mm  /  "
                 f"ICP fitness={res['icp_fitness']:.4f}, RMSE={res['icp_rmse']:.4f} mm"
             )
             tlay.addWidget(stat)
-            plotter = QtInteractor(tab)
+            plotter = QtInteractor()
+            plotters.append(plotter)
             self.tab2._setup_plotter_jp_fonts(plotter)
             bg, _ = self.tab2._load_visual_settings()
             plotter.set_background(bg, top=self.tab2._background_top_color(bg))
             self.tab2._configure_lights(plotter)
             try:
-                plotter.add_mesh(target.copy(), color='#b0b0b0', opacity=0.55,
-                                 smooth_shading=True, name='cand')
+                # 灰: target = 候補側のその軸アーム領域 STL（実際にフィットした相手のみ表示）
+                if target_arm is not None:
+                    plotter.add_mesh(target_arm.copy(), color='#b0b0b0', opacity=0.55,
+                                     smooth_shading=True, name='cand_arm')
+                # 橙: フィット適用後の base アーム領域
                 moved = src.copy()
                 moved.transform(np.asarray(T, dtype=float), inplace=True)
-                plotter.add_mesh(moved, color='#ff9030', opacity=0.65,
-                                 smooth_shading=True, name='arm')
+                plotter.add_mesh(moved, color='#ff9030', opacity=0.75,
+                                 smooth_shading=True, name='base_arm_moved')
                 plotter.reset_camera()
             except Exception as e:
                 widget.log_view.append(f'結果プロット中にエラー({L}): {e}')
             tlay.addWidget(plotter.interactor)
-            tabs.addTab(tab, L.upper())
+
+        info.setText(
+            '灰: 候補側のその軸アーム領域 STL（= フィット target） / '
+            '橙: base 側アーム領域 STL（= フィット source）をフィット適用後'
+        )
+        if len(results) == 1:
+            L, item = next(iter(results.items()))
+            tab = QWidget()
+            tlay = QVBoxLayout(tab)
+            _populate_one(L, item, tlay)
+            lay.addWidget(tab)
+        else:
+            tabs = QTabWidget()
+            lay.addWidget(tabs)
+            for L in type(self).AXIS_LETTERS:
+                item = results.get(L)
+                tab = QWidget()
+                tlay = QVBoxLayout(tab)
+                if item is None:
+                    msg = QLabel(f'{L.upper()}: フィット失敗または未実行')
+                    msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    tlay.addWidget(msg)
+                    tabs.addTab(tab, L.upper())
+                    continue
+                _populate_one(L, item, tlay)
+                tabs.addTab(tab, L.upper())
+        def _on_close(_ev=None):
+            for p in plotters:
+                try:
+                    p.close()
+                except Exception:
+                    pass
+        dlg.finished.connect(_on_close)
         # ESC で閉じる
         try:
             QShortcut(QKeySequence('Esc'), dlg).activated.connect(dlg.close)
@@ -6361,7 +6677,7 @@ class InitialPostureCandidatesWidget(QWidget):
         if not hasattr(self, '_dialogs'):
             self._dialogs = []
         self._dialogs.append(dlg)
-        dlg.show()
+        dlg.showMaximized()
 
     # ----- 検討事項（タブごとに変化）-----
     def _update_candidate_check_label(self, widget):
@@ -6372,8 +6688,33 @@ class InitialPostureCandidatesWidget(QWidget):
         rot_axes = getattr(av, 'rotation_axes', None) or []
         par_axes = getattr(av, 'parallel_axes', None) or []
         cw_dict = getattr(av, 'c_world', None)
-        if cw_dict is None or not (rot_axes or par_axes):
-            widget.check_label.setText('（ALL VIEW で C_world と U〜Z 軸を取り込むと値が出ます）')
+        # 足りない要素を明示する
+        if cw_dict is None or not (rot_axes and par_axes) or \
+                widget.fit_transform is None or \
+                not any(v is not None for v in (widget.fit_arm_transforms or {}).values()):
+            missing = []
+            if cw_dict is None:
+                missing.append('ALL VIEW で C_world を生成（W平面を3つ点うちして生成）')
+            if not rot_axes:
+                missing.append('ALL VIEW で「U/V/W rotation-axis を取り込み / 更新」をクリック')
+            if not par_axes:
+                missing.append('ALL VIEW で「X/Y/Z parallel-axis を取り込み / 更新」をクリック')
+            if widget.fit_transform is None:
+                missing.append('この候補タブの「① 固定部(C_world)フィット」を実行')
+            arm = widget.fit_arm_transforms or {}
+            missing_axes = [L.upper() for L in type(self).AXIS_LETTERS if arm.get(L) is None]
+            if missing_axes:
+                missing.append(
+                    f'この候補タブの「② 各 axis を再生成」を実行（未完了: {", ".join(missing_axes)} 軸）'
+                )
+            if not missing:
+                # 一部条件で漏れたとき
+                widget.check_label.setText('（軸方向が計算できません）')
+                return
+            html = ['<b>検討事項を表示するには以下が必要です:</b>']
+            for i, m in enumerate(missing, 1):
+                html.append(f'　{i}. {m}')
+            widget.check_label.setText('<br>'.join(html))
             return
         R_w_base = np.column_stack([cw_dict['ex'], cw_dict['ey'], cw_dict['ez']])
 
