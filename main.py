@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QObject, QEvent
 from tabs.tab1 import Tab1Widget
-from tabs.tab2 import Tab2Widget, FEAxisWidget, InitialPostureCandidatesWidget
+from tabs.tab2 import Tab2Widget, Tab2WidgetTMC, FEAxisWidget, InitialPostureCandidatesWidget
 from tabs.tab3 import Tab3Widget
 from tabs.tab4 import Tab4Widget
 
@@ -37,12 +37,18 @@ class MainWindow(QMainWindow):
 
 		self.tabs = QTabWidget()
 		self.tab1 = Tab1Widget()
+		# 都立大（既存データ tab2.* を引き継ぐ）
 		self.tab2 = Tab2Widget()
 		self.tab_candidates = InitialPostureCandidatesWidget(self.tab2)
+		# 医科大（永続化キーは tab2_tmc.* で完全独立）
+		self.tab2_tmc = Tab2WidgetTMC()
+		self.tab_candidates_tmc = InitialPostureCandidatesWidget(self.tab2_tmc)
 		self.tab_fe = FEAxisWidget()
 		self.tabs.addTab(self.tab1, '初期姿勢校正Ver. 1（色変更）')
-		self.tabs.addTab(self.tab2, '初期姿勢校正Ver. 2（実用）')
-		self.tabs.addTab(self.tab_candidates, '初期姿勢候補')
+		self.tabs.addTab(self.tab2, '初期姿勢校正Ver. 2（都立大）')
+		self.tabs.addTab(self.tab_candidates, '初期姿勢候補（都立大）')
+		self.tabs.addTab(self.tab2_tmc, '初期姿勢校正Ver. 2（医科大）')
+		self.tabs.addTab(self.tab_candidates_tmc, '初期姿勢候補（医科大）')
 		self.tabs.addTab(self.tab_fe, '呂')
 		self.tabs.addTab(Tab3Widget(), 'KKR graph')
 		self.tabs.addTab(Tab4Widget(), '設定')
@@ -50,11 +56,36 @@ class MainWindow(QMainWindow):
 		if hasattr(self.tab2, 'posture_subtabs'):
 			self.tab2.posture_subtabs.setCurrentIndex(0)
 		self.setCentralWidget(self.tabs)
+		# トップタブ切替時に、共有カメラ（C_world 基準）を切替先の plotter に反映。
+		# 都立大 Ver.2 ↔ 都立大候補、医科大 Ver.2 ↔ 医科大候補 で視点が連動する。
+		# 医科大と都立大の間では shared_camera_world が別物なので連動しない（仕様通り）。
+		self.tabs.currentChanged.connect(self._on_top_tab_changed)
+
+	def _on_top_tab_changed(self, idx):
+		w = self.tabs.widget(idx)
+		# Ver.2（都立大 / 医科大）に切り替わった: 現在の内部サブタブに shared を反映
+		if isinstance(w, Tab2Widget):
+			try:
+				cur = w.top_subtabs.currentIndex()
+				w._on_top_subtab_changed(cur)
+			except Exception:
+				pass
+			return
+		# 初期姿勢候補（都立大 / 医科大）に切り替わった: 現在表示中の候補に shared を反映
+		if isinstance(w, InitialPostureCandidatesWidget):
+			try:
+				cur = w.subtabs.currentIndex()
+				if cur >= 0:
+					w._on_current_changed(cur)
+			except Exception:
+				pass
+			return
 
 	def closeEvent(self, event):
 		for widget in (
 			getattr(self, 'tab1', None),
 			getattr(self, 'tab2', None),
+			getattr(self, 'tab2_tmc', None),
 			getattr(self, 'tab_fe', None),
 		):
 			cleanup = getattr(widget, 'cleanup', None)

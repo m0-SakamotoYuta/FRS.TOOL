@@ -5541,6 +5541,15 @@ class Tab2Widget(QWidget):
         dlg.show()
 
 
+class Tab2WidgetTMC(Tab2Widget):
+    """医科大用 Tab2。処理は Tab2Widget と完全に同一で、永続化キーだけが独立。
+
+    settings.json 上のトップキーが 'tab2_tmc' になるため、STL パス・フィット結果・
+    視点・カメラ・取り込んだ軸 motion などが都立大 (Tab2Widget) と完全に分離される。
+    """
+    SETTINGS_TOP_KEY = 'tab2_tmc'
+
+
 class InitialPostureCandidatesWidget(QWidget):
     """初期姿勢候補タブ：修正後スキャンを複数並べて、検討事項が最良の姿勢を探す。
 
