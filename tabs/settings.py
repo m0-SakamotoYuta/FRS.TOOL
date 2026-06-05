@@ -1,10 +1,15 @@
 import json
 import os
+import shutil
+from datetime import date
 from pathlib import Path
 
 _LIGHTING_KEY = 'lighting_enabled'
 _lighting_enabled_cache = None
 _lighting_listeners = []
+
+# 日付付きバックアップの保持日数
+_DAILY_BACKUP_RETAIN_DAYS = 30
 
 
 def _get_settings_path() -> Path:
@@ -12,6 +17,56 @@ def _get_settings_path() -> Path:
     folder = Path(base) / 'FRS-Simulator'
     folder.mkdir(parents=True, exist_ok=True)
     return folder / 'settings.json'
+
+
+def _get_daily_backup_dir() -> Path:
+    folder = _get_settings_path().parent / 'daily_backups'
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def ensure_startup_backup() -> None:
+    """起動時に 1 回だけ呼ぶ。現在の settings.json をセッション開始時のスナップショットとして保存する。
+
+    `settings.json.startup` は毎回上書きするが、これは「起動時点の状態」を表すため、
+    セッション中にどんな破壊的変更が起きても起動時点に戻せる。
+    日付付きバックアップ（daily_backups/settings-YYYY-MM-DD.json）も同時に作成し、
+    その日の最初の起動時の状態を 1 日 1 ファイルとして長期保存する。
+    """
+    path = _get_settings_path()
+    if not path.exists():
+        return
+    # 1) 起動時スナップショット（毎回上書き、固定名）
+    try:
+        shutil.copy2(str(path), str(path.with_suffix('.json.startup')))
+    except Exception:
+        pass
+    # 2) 日付付きバックアップ（1 日 1 ファイル、その日の最初の起動時だけ作成）
+    try:
+        daily_dir = _get_daily_backup_dir()
+        today_file = daily_dir / f'settings-{date.today().isoformat()}.json'
+        if not today_file.exists():
+            shutil.copy2(str(path), str(today_file))
+        # 古い日付付きバックアップを掃除（保持日数を超えたものを削除）
+        _prune_daily_backups(daily_dir)
+    except Exception:
+        pass
+
+
+def _prune_daily_backups(daily_dir: Path) -> None:
+    try:
+        files = sorted(
+            (p for p in daily_dir.glob('settings-*.json') if p.is_file()),
+            key=lambda p: p.name,
+        )
+        if len(files) > _DAILY_BACKUP_RETAIN_DAYS:
+            for old in files[:-_DAILY_BACKUP_RETAIN_DAYS]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def load_settings() -> dict:
@@ -27,9 +82,23 @@ def load_settings() -> dict:
 
 def save_settings(d: dict):
     path = _get_settings_path()
+    # 保存前にバックアップを取得（直近5世代まで保持）
     try:
-        with open(path, 'w', encoding='utf-8') as f:
+        if path.exists():
+            for i in range(4, 0, -1):
+                src = path.with_suffix(f'.json.bak{i}')
+                dst = path.with_suffix(f'.json.bak{i+1}')
+                if src.exists():
+                    shutil.move(str(src), str(dst))
+            shutil.copy2(str(path), str(path.with_suffix('.json.bak1')))
+    except Exception:
+        pass
+    try:
+        # atomic write: 一時ファイルに書いてから rename
+        tmp_path = path.with_suffix('.json.tmp')
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(str(tmp_path), str(path))
     except Exception:
         pass
 

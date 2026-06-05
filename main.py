@@ -7,13 +7,26 @@ from PyQt6.QtWidgets import (
 	QWidget,
 	QVBoxLayout,
 	QTabWidget,
+	QAbstractSpinBox,
 )
+from PyQt6.QtCore import QObject, QEvent
 from tabs.tab1 import Tab1Widget
 from tabs.tab2 import Tab2Widget, FEAxisWidget, InitialPostureCandidatesWidget
 from tabs.tab3 import Tab3Widget
 from tabs.tab4 import Tab4Widget
+
+
+class _NoWheelOnSpinBoxFilter(QObject):
+	"""QSpinBox / QDoubleSpinBox 上でマウスホイールによる値変更を無効化する。
+	右側の▲▼ボタンか、直接入力でのみ値を変更できるようにする。"""
+
+	def eventFilter(self, watched, event):
+		if event.type() == QEvent.Type.Wheel and isinstance(watched, QAbstractSpinBox):
+			event.ignore()
+			return True
+		return False
 from splash import Splash
-from tabs.settings import load_settings, apply_theme
+from tabs.settings import load_settings, apply_theme, ensure_startup_backup
 
 
 class MainWindow(QMainWindow):
@@ -55,6 +68,11 @@ class MainWindow(QMainWindow):
 
 def main():
 	app = QApplication(sys.argv)
+	# スピンボックスのマウスホイール無効化（アプリ全体に適用）
+	_spin_filter = _NoWheelOnSpinBoxFilter()
+	app.installEventFilter(_spin_filter)
+	app._spin_filter_ref = _spin_filter   # GC 防止のため参照保持
+
 	# まずスプラッシュ（ロード画面）を表示し、キャッシュ（設定）を読み込む
 	splash = Splash()
 
@@ -75,6 +93,14 @@ def main():
 	try:
 		splash.append_log('設定ファイル読み込みを開始します...')
 		app.processEvents()
+		# 起動時バックアップ（settings.json.startup と日付付きバックアップ）
+		try:
+			ensure_startup_backup()
+			splash.append_log('起動時バックアップを作成しました')
+			app.processEvents()
+		except Exception as e:
+			splash.append_log(f'起動時バックアップ作成中にエラー: {e}')
+			app.processEvents()
 		settings = load_settings()
 		splash.set_progress(25)
 		splash.append_log('設定ファイル読み込み完了')

@@ -5568,11 +5568,19 @@ class InitialPostureCandidatesWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
 
+        header_row = QHBoxLayout()
         info = QLabel('初期姿勢候補：修正後スキャンを並べて、検討事項が最良の姿勢を選びます。'
                       ' タブ名はダブルクリックで編集できます。')
         info.setStyleSheet('font-size: 11px; color: #bfe4ff;')
         info.setWordWrap(True)
-        layout.addWidget(info)
+        header_row.addWidget(info, 1)
+
+        add_btn = QPushButton('+ 候補を追加')
+        add_btn.setMaximumHeight(28)
+        add_btn.setMinimumWidth(120)
+        add_btn.clicked.connect(lambda: self.add_candidate())
+        header_row.addWidget(add_btn, 0)
+        layout.addLayout(header_row)
 
         self.subtabs = QTabWidget()
         self.subtabs.setTabsClosable(True)
@@ -5580,11 +5588,6 @@ class InitialPostureCandidatesWidget(QWidget):
         self.subtabs.tabBarDoubleClicked.connect(self._on_rename_tab)
         self.subtabs.currentChanged.connect(self._on_current_changed)
         layout.addWidget(self.subtabs, 1)
-
-        add_btn = QPushButton('+ 候補を追加')
-        add_btn.setMaximumHeight(28)
-        add_btn.clicked.connect(lambda: self.add_candidate())
-        self.subtabs.setCornerWidget(add_btn)
 
         # 永続化から復元（STL は async ロード）
         self._load_from_settings()
@@ -5939,13 +5942,18 @@ class InitialPostureCandidatesWidget(QWidget):
                 'region_clear_btn': region_clear_btn,
                 'region_status': region_status,
             }
-        # 表示トグル
+        # 表示トグル: 矢印 と C_world は独立して切替可能
         toggle_row = QHBoxLayout()
-        show_arrows_cb = QCheckBox('矢印を表示')
+        show_arrows_cb = QCheckBox('軸の矢印を表示')
         show_arrows_cb.setChecked(False)
+        show_cworld_cb = QCheckBox('C_world を表示')
+        show_cworld_cb.setChecked(True)
         toggle_row.addWidget(show_arrows_cb)
+        toggle_row.addWidget(show_cworld_cb)
         toggle_row.addStretch()
         axes_layout.addLayout(toggle_row)
+        widget.show_cworld_cb = show_cworld_cb
+        widget.show_cworld = True
         # 個別軸トグル（U〜Z）
         per_axis_row = QHBoxLayout()
         per_axis_cbs = {}
@@ -6141,6 +6149,12 @@ class InitialPostureCandidatesWidget(QWidget):
             self._save_to_settings()
         show_arrows_cb.toggled.connect(_on_arrow_toggled)
 
+        def _on_cworld_toggled(checked):
+            widget.show_cworld = bool(checked)
+            self._render_candidate_view(widget, reset_view=False)
+            self._save_to_settings()
+        show_cworld_cb.toggled.connect(_on_cworld_toggled)
+
         for L, cb in per_axis_cbs.items():
             def _on_axis_vis_toggled(checked, axis=L):
                 widget.axis_visibility[axis] = bool(checked)
@@ -6235,23 +6249,24 @@ class InitialPostureCandidatesWidget(QWidget):
         b = widget.current_mesh.bounds
         diag = float(np.linalg.norm([b[1]-b[0], b[3]-b[2], b[5]-b[4]])) or 100.0
 
-        # C_world（このタブの STL 座標で表したもの）
-        cw = self.tab2._effective_c_world_for_widget(widget)
-        if cw is not None:
-            axis_len = max(diag * 0.18, 1.0)
-            origin = np.asarray(cw['origin'], dtype=float)
-            for suffix, vec, color in (
-                ('_x', cw['ex'], '#ff3030'),
-                ('_y', cw['ey'], '#3060ff'),
-                ('_z', cw['ez'], '#30c030'),
-            ):
-                try:
-                    arrow = pv.Arrow(start=origin, direction=vec, scale=axis_len,
-                                     shaft_radius=0.012, tip_radius=0.04, tip_length=0.18)
-                    plotter.add_mesh(arrow, name='cw'+suffix, color=color,
-                                     pickable=False, reset_camera=False, render=False)
-                except Exception:
-                    pass
+        # C_world（このタブの STL 座標で表したもの）— 矢印トグルとは独立した show_cworld で制御
+        if bool(getattr(widget, 'show_cworld', True)):
+            cw = self.tab2._effective_c_world_for_widget(widget)
+            if cw is not None:
+                axis_len = max(diag * 0.18, 1.0)
+                origin = np.asarray(cw['origin'], dtype=float)
+                for suffix, vec, color in (
+                    ('_x', cw['ex'], '#ff3030'),
+                    ('_y', cw['ey'], '#3060ff'),
+                    ('_z', cw['ez'], '#30c030'),
+                ):
+                    try:
+                        arrow = pv.Arrow(start=origin, direction=vec, scale=axis_len,
+                                         shaft_radius=0.012, tip_radius=0.04, tip_length=0.18)
+                        plotter.add_mesh(arrow, name='cw'+suffix, color=color,
+                                         pickable=False, reset_camera=False, render=False)
+                    except Exception:
+                        pass
 
         # 6 軸（imported 軸を各 T_arm_new_L で運んだ方向を描画）
         self._draw_imported_axes_on_candidate(widget, plotter, diag)
