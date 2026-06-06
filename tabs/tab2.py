@@ -6839,6 +6839,1089 @@ class InitialPostureCandidatesWidget(QWidget):
         widget.check_label.setText('<br>'.join(html))
 
 
+class WAxisCalibrationWidget(QWidget):
+    """W軸校正タブ：C_se の X 軸（Clump YZ 平面の法線）と Ver.2 ALL VIEW の
+    X_parallel-axis との傾きを比較し、初期姿勢における W 軸の回転量を表示する。
+
+    UI は ALL VIEW タブと同じレイアウト（左パネル + 右 plotter + 下ログ）。
+    平面サブタブ:
+      ・W平面1（XY平面）/ W平面2（YZ平面）/ W平面3（ZX平面） — C_world 用（ALL VIEW と同じ）
+      ・Clump YZ平面 — C_se_X 用（3 点以上の最小二乗フィット）
+
+    永続化: settings[tab2.settings_top_key]['w_axis_calib']
+      都立大: tab2.w_axis_calib / 医科大: tab2_tmc.w_axis_calib
+    """
+
+    SETTINGS_KEY = 'w_axis_calib'
+    PLANE_KEY_CLUMP = 'Clump YZ平面'
+
+    def __init__(self, tab2_widget, parent=None):
+        super().__init__(parent)
+        self.tab2 = tab2_widget
+        # Ver.2 で軸が取り込まれたら自動で検討事項と描画を更新
+        if not hasattr(tab2_widget, '_on_axes_imported_callbacks'):
+            tab2_widget._on_axes_imported_callbacks = []
+        tab2_widget._on_axes_imported_callbacks.append(self._on_ver2_axes_imported)
+        # plane-point ハンドラ互換用属性
+        self.posture_key = None        # _save_posture_cache を no-op にする
+        self.axis_letter = None
+        self.view_kind = 'w_calib'
+        self.display_in_world_frame = False
+        self.is_base_pose = False
+        # このウィジェット自身の状態
+        self.current_mesh = None
+        self.stl_path = None
+        self.region_mesh = None
+        self.region_stl_path = None
+        # C_world は Ver.2 ALL VIEW から自動参照（このタブでは構築しない）
+        # ただし、Ver.2 と座標系が異なるため、フィッティング (T: this STL → base STL) を経由する。
+        self.fit_transform = None       # 4x4 ndarray: このタブ STL 座標 → Ver.2 base STL 座標
+        self.fit_result = None          # フィット結果 dict (fitness/rmse など)
+        self.c_se_x = None              # YZ 平面の法線 (3,) ndarray、STL 座標系で
+        self.c_se_origin = None         # YZ 平面の重心（描画起点）
+        self.show_x_parallel = True
+        self.show_cworld = True
+        self.show_cse = True
+        # plane-point 共有点群（Clump YZ平面のみ）
+        self.shared_points = {}         # 互換のため空
+        self.shared_world_points = {}   # W平面1/2/3 は廃止（互換のため空 dict は維持）
+        self.shared_clump_points = {type(self).PLANE_KEY_CLUMP: []}
+        self.active_plane_index = 0
+        self.plane_widgets = []
+        # 保存抑止フラグ（復元中に save を呼ばない）
+        self._loading = False
+
+        self._build_ui()
+        self._load_from_settings()
+
+    # ===== UI 構築 =====
+    def _build_ui(self):
+        main_layout = QVBoxLayout(self)
+        top_layout = QHBoxLayout()
+
+        # === 左パネル ===
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+
+        title = QLabel('W軸校正')
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet('font-weight: bold; font-size: 12px;')
+        left_layout.addWidget(title)
+
+        # STL（with clump）
+        self.load_btn = QPushButton('STL（with clump）を読み込む')
+        self.clear_stl_btn = QPushButton('読み込んだSTLを消去')
+        self.clear_stl_btn.setEnabled(False)
+        left_layout.addWidget(self.load_btn)
+        left_layout.addWidget(self.clear_stl_btn)
+
+        # 固定部領域 STL
+        self.load_region_btn = QPushButton('固定部(C_world)領域STLを読み込む')
+        self.clear_region_btn = QPushButton('固定部領域STLを消去')
+        self.clear_region_btn.setEnabled(False)
+        left_layout.addWidget(self.load_region_btn)
+        left_layout.addWidget(self.clear_region_btn)
+
+        # 光源
+        self.tab2._add_lighting_toggle(left_layout, self)
+
+        # === Ver.2 base 固定部領域とのフィッティング ===
+        fit_group = QGroupBox('Ver.2 base 固定部領域とのフィッティング（C_world 同期）')
+        fit_layout = QVBoxLayout(fit_group)
+        fit_note = QLabel('上で読み込んだ「固定部領域 STL（with clump 側）」を、'
+                          'Ver.2 ALL VIEW の base 固定部領域 STL にフィットさせます。'
+                          ' これにより、Ver.2 の C_world と X_parallel-axis が、'
+                          'このタブの STL 座標で正しい位置に表示されます。')
+        fit_note.setWordWrap(True)
+        fit_note.setStyleSheet('color: #80c0ff; font-size: 10px;')
+        fit_layout.addWidget(fit_note)
+
+        def _mp(layout, label_text, lo, hi, default, decimals=0, suffix=''):
+            row = QHBoxLayout()
+            lbl = QLabel(label_text); lbl.setMinimumWidth(110)
+            if decimals > 0:
+                from PyQt6.QtWidgets import QDoubleSpinBox
+                spin = QDoubleSpinBox(); spin.setDecimals(decimals)
+            else:
+                spin = QSpinBox()
+            spin.setRange(lo, hi); spin.setValue(default)
+            if suffix: spin.setSuffix(suffix)
+            row.addWidget(lbl); row.addWidget(spin, 1)
+            layout.addLayout(row)
+            return spin
+
+        self.fit_voxel_spin = _mp(fit_layout, 'voxel サイズ:', 0.0, 1000.0, 0.0, decimals=3, suffix=' mm')
+        self.fit_voxel_spin.setToolTip('0 にすると対角長から自動推定します。')
+        self.fit_ransac_iter_spin = _mp(fit_layout, 'RANSAC 反復:', 1000, 10000000, 100000)
+        self.fit_icp_iter_spin = _mp(fit_layout, 'ICP 反復:', 1, 2000, 50)
+        self.fit_dist_spin = _mp(fit_layout, '距離係数(×voxel):', 0.1, 50.0, 1.5, decimals=2)
+
+        self.fit_btn = QPushButton('Ver.2 base 固定部領域へフィッティング')
+        self.fit_btn.setEnabled(False)
+        self.fit_check_btn = QPushButton('フィット結果を確認')
+        self.fit_check_btn.setEnabled(False)
+        self.clear_fit_btn = QPushButton('フィット結果を消去')
+        self.clear_fit_btn.setEnabled(False)
+        self.fit_status_label = QLabel('未フィット')
+        self.fit_status_label.setStyleSheet('color: #ffd060; font-size: 10px;')
+        fit_layout.addWidget(self.fit_btn)
+        fit_layout.addWidget(self.fit_check_btn)
+        fit_layout.addWidget(self.clear_fit_btn)
+        fit_layout.addWidget(self.fit_status_label)
+        left_layout.addWidget(fit_group)
+
+        # C_se_X 生成/消去（Clump YZ平面の法線）
+        self.build_cse_btn = QPushButton('C_se_X（YZ平面法線）を生成')
+        self.build_cse_btn.setEnabled(False)
+        self.clear_cse_btn = QPushButton('C_se_X を消去')
+        self.clear_cse_btn.setEnabled(False)
+        left_layout.addWidget(self.build_cse_btn)
+        left_layout.addWidget(self.clear_cse_btn)
+
+        # X_parallel-axis 表示トグル
+        self.show_xpar_cb = QCheckBox('X_parallel-axis を表示（Ver.2 ALL VIEW から自動参照）')
+        self.show_xpar_cb.setChecked(True)
+        self.show_xpar_cb.setStyleSheet('color: #ff8040; font-weight: bold;')
+        left_layout.addWidget(self.show_xpar_cb)
+        # C_world / C_se 表示トグル
+        self.show_cworld_cb = QCheckBox('C_world を表示')
+        self.show_cworld_cb.setChecked(True)
+        self.show_cworld_cb.setStyleSheet('color: #80c0ff; font-weight: bold;')
+        left_layout.addWidget(self.show_cworld_cb)
+        self.show_cse_cb = QCheckBox('C_se_X（YZ平面法線）を表示')
+        self.show_cse_cb.setChecked(True)
+        self.show_cse_cb.setStyleSheet('color: #f0c040; font-weight: bold;')
+        left_layout.addWidget(self.show_cse_cb)
+
+        # 検討事項
+        check_group = QGroupBox('検討事項')
+        check_layout = QVBoxLayout(check_group)
+        self.check_label = QLabel('（STL を読み込み、Clump YZ平面に 3 点以上ピック → 「C_se_X を生成」を押すと結果がここに表示されます。'
+                                  ' C_world は Ver.2 ALL VIEW で構築したものを自動参照します。）')
+        self.check_label.setWordWrap(True)
+        self.check_label.setTextFormat(Qt.TextFormat.RichText)
+        self.check_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        check_layout.addWidget(self.check_label)
+        left_layout.addWidget(check_group)
+
+        # === 平面サブタブ: Clump YZ平面のみ ===
+        self.plane_subtabs = QTabWidget()
+        plane_specs = [
+            (type(self).PLANE_KEY_CLUMP, 'Clump YZ平面 [C_se_X 用 / 3点以上で最小二乗フィット]'),
+        ]
+        for plane_label, plane_title in plane_specs:
+            pw = self.tab2._create_plane_point_controls_widget(plane_label, plane_title)
+            pw.posture_widget = self
+            pw.system_type = 'c_world'  # 描画色判定用
+            pw.points = self.shared_clump_points.setdefault(plane_label, [])
+            pw.log_view = None  # plotter 構築後に差し替え
+            self.plane_widgets.append(pw)
+            self.plane_subtabs.addTab(pw, plane_label)
+        left_layout.addWidget(self.plane_subtabs, 1)
+        left_layout.addStretch()
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left_panel)
+        left_scroll.setMinimumWidth(300)
+        left_scroll.setMaximumWidth(440)
+
+        # === 右パネル: 3D ビュー ===
+        if HAS_PYVISTA:
+            self.plotter = QtInteractor(self)
+            self.tab2._setup_plotter_jp_fonts(self.plotter)
+            bg, _ = self.tab2._load_visual_settings()
+            self.plotter.set_background(bg, top=self.tab2._background_top_color(bg))
+            self.plotter.add_text('STL（with clump）を読み込んでください', position='upper_left', font_size=10)
+            self.tab2._configure_lights(self.plotter)
+            right_view = self.plotter.interactor
+        else:
+            self.plotter = None
+            right_view = QLabel('pyvista / pyvistaqt が未インストール')
+            right_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # 共有カメラ用属性
+        self.tab2._attach_camera_observer(self)
+
+        top_layout.addWidget(left_scroll, 1)
+        top_layout.addWidget(right_view, 4)
+
+        # === ログ ===
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText('ログ')
+        self.log_view.setMinimumHeight(100)
+        self.log_view.setMaximumHeight(180)
+
+        main_layout.addLayout(top_layout, 5)
+        main_layout.addWidget(self.log_view, 1)
+
+        # 各 plane_widget の plotter/log を差し込み、ハンドラを wire up
+        for pw in self.plane_widgets:
+            pw.plotter = self.plotter
+            pw.log_view = self.log_view
+            self.tab2._wire_plane_point_handlers(pw)
+            pw._refresh_point_list()
+
+        self.tab2.visual_widgets.append(self)
+
+        # === シグナル接続 ===
+        self.load_btn.clicked.connect(self._open_stl)
+        self.clear_stl_btn.clicked.connect(self._clear_stl)
+        self.load_region_btn.clicked.connect(self._open_region)
+        self.clear_region_btn.clicked.connect(self._clear_region)
+        self.fit_btn.clicked.connect(self._run_fit)
+        self.fit_check_btn.clicked.connect(self._show_fit_check_dialog)
+        self.clear_fit_btn.clicked.connect(self._clear_fit)
+        self.build_cse_btn.clicked.connect(self._build_c_se_x)
+        self.clear_cse_btn.clicked.connect(self._clear_c_se_x)
+        self.show_xpar_cb.toggled.connect(self._on_show_xpar_toggled)
+        self.show_cworld_cb.toggled.connect(self._on_show_cworld_toggled)
+        self.show_cse_cb.toggled.connect(self._on_show_cse_toggled)
+        self.plane_subtabs.currentChanged.connect(self._on_plane_subtab_changed)
+
+    # ===== STL 読込/消去 =====
+    def _open_stl(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'STL（with clump） を開く', '', 'STL Files (*.stl)')
+        if not path:
+            return
+        self._start_load_stl(path, preserve_state=False)
+
+    def _start_load_stl(self, path, preserve_state=False):
+        if not HAS_PYVISTA:
+            self.log_view.append('pyvista が無いため STL を読み込めません。')
+            return
+        self._pending_stl_path = path
+        self._pending_preserve = bool(preserve_state)
+        self.load_btn.setEnabled(False)
+        self.clear_stl_btn.setEnabled(False)
+        self.log_view.append(f'読込要求: {path}' + ('（キャッシュ復元）' if preserve_state else ''))
+
+        self._stl_thread = QThread(self)
+        self._stl_worker = STLLoadWorker(path)
+        self._stl_worker.moveToThread(self._stl_thread)
+        self._stl_thread.started.connect(self._stl_worker.run)
+        self._stl_worker.log.connect(lambda m: self.log_view.append(m))
+        self._stl_worker.finished.connect(self._on_stl_loaded)
+        self._stl_worker.error.connect(self._on_stl_load_error)
+        self._stl_worker.finished.connect(self._stl_thread.quit)
+        self._stl_worker.error.connect(self._stl_thread.quit)
+        self._stl_worker.finished.connect(self._stl_worker.deleteLater)
+        self._stl_worker.error.connect(self._stl_worker.deleteLater)
+        self._stl_thread.finished.connect(self._stl_thread.deleteLater)
+        self._stl_thread.start()
+
+    def _on_stl_loaded(self, mesh):
+        self.current_mesh = mesh
+        self.stl_path = getattr(self, '_pending_stl_path', None) or self.stl_path
+        preserve = bool(getattr(self, '_pending_preserve', False))
+        if not preserve:
+            self.c_se_x = None
+            self.c_se_origin = None
+            for pw in self.plane_widgets:
+                pw.current_mesh = mesh
+                pw.points.clear()
+                pw.selected_point_index = -1
+                pw.point_add_enabled = False
+                pw.point_add_btn.setChecked(False)
+                pw.point_add_btn.setEnabled(True)
+                pw._refresh_point_list()
+        else:
+            for pw in self.plane_widgets:
+                pw.current_mesh = mesh
+                pw.point_add_enabled = False
+                pw.point_add_btn.setChecked(False)
+                pw.point_add_btn.setEnabled(True)
+                pw.selected_point_index = (len(pw.points) - 1) if pw.points else -1
+                pw._refresh_point_list()
+        self.build_cse_btn.setEnabled(True)
+        self.clear_cse_btn.setEnabled(self.c_se_x is not None)
+        self.load_btn.setEnabled(True)
+        self.clear_stl_btn.setEnabled(True)
+        self.log_view.append('STL 読込完了')
+        self._render_view(reset_view=not preserve)
+        self._update_check_label()
+        self._save_to_settings()
+
+    def _on_stl_load_error(self, msg):
+        self.log_view.append(msg)
+        self.load_btn.setEnabled(True)
+        self.clear_stl_btn.setEnabled(self.current_mesh is not None)
+
+    def _clear_stl(self):
+        self.current_mesh = None
+        self.stl_path = None
+        self.c_se_x = None
+        self.c_se_origin = None
+        for pw in self.plane_widgets:
+            pw.current_mesh = None
+            pw.points.clear()
+            pw.selected_point_index = -1
+            pw.point_add_enabled = False
+            pw.point_add_btn.setChecked(False)
+            pw.point_add_btn.setEnabled(False)
+            pw._refresh_point_list()
+        self.clear_stl_btn.setEnabled(False)
+        self.build_cse_btn.setEnabled(False)
+        self.clear_cse_btn.setEnabled(False)
+        if self.plotter is not None:
+            try:
+                self.plotter.clear()
+                self.plotter.add_text('STL（with clump）を読み込んでください', position='upper_left', font_size=10)
+                self.plotter.render()
+            except Exception:
+                pass
+        self.log_view.append('STL とピック点・C_world / C_se_X をクリアしました。')
+        self._update_check_label()
+        self._save_to_settings()
+
+    # ===== 固定部領域 STL 読込/消去 =====
+    def _open_region(self):
+        path, _ = QFileDialog.getOpenFileName(self, '固定部(C_world)領域 STL を開く', '', 'STL Files (*.stl)')
+        if not path:
+            return
+        self._load_region_path(path)
+
+    def _load_region_path(self, path):
+        if not HAS_PYVISTA:
+            return
+        try:
+            mesh = self.tab2._read_region_mesh(path)
+        except Exception as e:
+            self.log_view.append(f'固定部領域 STL 読込失敗: {e}')
+            return
+        self.region_mesh = mesh
+        self.region_stl_path = path
+        self.clear_region_btn.setEnabled(True)
+        self._update_fit_btn_enabled()
+        self.log_view.append(f'固定部領域 STL 読込: {path} (points={mesh.n_points})')
+        self._render_view(reset_view=False)
+        self._save_to_settings()
+
+    def _clear_region(self):
+        self.region_mesh = None
+        self.region_stl_path = None
+        self.clear_region_btn.setEnabled(False)
+        self._update_fit_btn_enabled()
+        self.log_view.append('固定部領域 STL を消去しました。')
+        self._render_view(reset_view=False)
+        self._save_to_settings()
+
+    def _update_fit_btn_enabled(self):
+        """フィットボタンの有効/無効: 自タブと Ver.2 base の両方の領域 STL があれば有効。"""
+        av = getattr(self.tab2, 'all_view_widget', None)
+        ver2_region = getattr(av, 'region_mesh', None) if av is not None else None
+        try:
+            self.fit_btn.setEnabled(self.region_mesh is not None and ver2_region is not None)
+        except Exception:
+            pass
+
+    # ===== Ver.2 base 固定部領域とのフィッティング =====
+    def _run_fit(self):
+        if not HAS_OPEN3D:
+            self.log_view.append('open3d が見つかりません。`pip install open3d` を実行してください。')
+            return
+        if self.region_mesh is None:
+            self.log_view.append('このタブの固定部領域 STL（with clump 側）が未読込です。')
+            return
+        av = getattr(self.tab2, 'all_view_widget', None)
+        target = getattr(av, 'region_mesh', None) if av is not None else None
+        if target is None:
+            self.log_view.append('Ver.2 ALL VIEW の base 固定部領域 STL が未読込です。')
+            return
+        params = {
+            'voxel_size': float(self.fit_voxel_spin.value()),
+            'ransac_iter': int(self.fit_ransac_iter_spin.value()),
+            'icp_iter': int(self.fit_icp_iter_spin.value()),
+            'dist_factor': float(self.fit_dist_spin.value()),
+        }
+        self.log_view.append('=== Ver.2 base 固定部領域へフィッティング開始（RANSAC → ICP） ===')
+        self.fit_btn.setEnabled(False)
+        self.fit_status_label.setText('フィッティング実行中...')
+
+        self._fit_thread = QThread(self)
+        self._fit_worker = FitWorker(self.region_mesh, target, params)
+        self._fit_worker.moveToThread(self._fit_thread)
+        self._fit_thread.started.connect(self._fit_worker.run)
+        self._fit_worker.log.connect(lambda m: self.log_view.append(m))
+        self._fit_worker.finished.connect(self._on_fit_done)
+        self._fit_worker.error.connect(self._on_fit_error)
+        self._fit_worker.finished.connect(self._fit_thread.quit)
+        self._fit_worker.error.connect(self._fit_thread.quit)
+        self._fit_worker.finished.connect(self._fit_worker.deleteLater)
+        self._fit_worker.error.connect(self._fit_worker.deleteLater)
+        self._fit_thread.finished.connect(self._fit_thread.deleteLater)
+        self._fit_thread.start()
+
+    def _on_fit_done(self, result):
+        if not isinstance(result, dict) or result.get('transform') is None:
+            self.log_view.append('フィッティング: 結果が不正です。')
+            self._update_fit_btn_enabled()
+            self.fit_status_label.setText('フィッティング失敗')
+            return
+        T = np.asarray(result['transform'], dtype=float)
+        self.fit_transform = T
+        self.fit_result = {k: result.get(k) for k in ('ransac_fitness', 'ransac_rmse', 'icp_fitness', 'icp_rmse', 'voxel_size')}
+        self.clear_fit_btn.setEnabled(True)
+        self._update_fit_btn_enabled()
+        rmse = result.get('icp_rmse')
+        fitness = result.get('icp_fitness')
+        self.fit_status_label.setText(
+            f'フィット完了: ICP fitness={fitness:.4f} / rmse={rmse:.4f} mm'
+            if isinstance(rmse, (int, float)) and isinstance(fitness, (int, float))
+            else 'フィット完了'
+        )
+        self.fit_status_label.setStyleSheet('color: #80ff80; font-size: 10px;')
+        self.log_view.append('=== フィッティング完了。C_world と X_parallel-axis がこのタブの STL 座標に同期されます。 ===')
+        # 変換行列をログにも出力
+        self.log_view.append('  変換行列 T (このタブ STL 座標 → Ver.2 base STL 座標):')
+        for r in range(4):
+            self.log_view.append(
+                f'    [{T[r,0]:+.5f}, {T[r,1]:+.5f}, {T[r,2]:+.5f}, {T[r,3]:+.4f}]'
+            )
+        self.fit_check_btn.setEnabled(True)
+        self._render_view(reset_view=False)
+        self._update_check_label()
+        self._save_to_settings()
+        # フィット完了後、自動でフィット結果確認ダイアログを表示
+        self._show_fit_check_dialog()
+
+    def _on_fit_error(self, msg):
+        self.log_view.append(msg)
+        self.fit_status_label.setText('フィッティング失敗')
+        self.fit_status_label.setStyleSheet('color: #ff8080; font-size: 10px;')
+        self._update_fit_btn_enabled()
+
+    def _clear_fit(self):
+        self.fit_transform = None
+        self.fit_result = None
+        self.clear_fit_btn.setEnabled(False)
+        self.fit_check_btn.setEnabled(False)
+        self.fit_status_label.setText('未フィット')
+        self.fit_status_label.setStyleSheet('color: #ffd060; font-size: 10px;')
+        self.log_view.append('フィット結果を消去しました。')
+        self._render_view(reset_view=False)
+        self._update_check_label()
+        self._save_to_settings()
+
+    def _show_fit_check_dialog(self):
+        """フィット結果を別ウィンドウで重ね表示する。
+        灰: Ver.2 base の固定部領域 STL / 橙: フィッティング後の自タブ領域 STL"""
+        if not HAS_PYVISTA:
+            self.log_view.append('pyvista が無いため結果を表示できません。')
+            return
+        if self.fit_transform is None or self.region_mesh is None:
+            self.log_view.append('フィッティング結果を表示できません（結果または領域 STL が不足）。')
+            return
+        av = getattr(self.tab2, 'all_view_widget', None)
+        target = getattr(av, 'region_mesh', None) if av is not None else None
+        if target is None:
+            self.log_view.append('Ver.2 ALL VIEW の base 固定部領域 STL が読み込まれていません。')
+            return
+        from PyQt6.QtWidgets import QDialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle('フィット結果の確認: W軸校正')
+        dlg.resize(880, 660)
+        lay = QVBoxLayout(dlg)
+        info = QLabel('灰: Ver.2 base の固定部領域 / 橙: フィッティング後の自タブ領域 STL')
+        lay.addWidget(info)
+        plotter = QtInteractor(dlg)
+        self.tab2._setup_plotter_jp_fonts(plotter)
+        bg, _ = self.tab2._load_visual_settings()
+        plotter.set_background(bg, top=self.tab2._background_top_color(bg))
+        self.tab2._configure_lights(plotter)
+        try:
+            plotter.add_mesh(target.copy(), color='#b0b0b0', opacity=0.55,
+                             smooth_shading=True, name='base_region')
+            moved = self.region_mesh.copy()
+            moved.transform(np.asarray(self.fit_transform, dtype=float), inplace=True)
+            plotter.add_mesh(moved, color='#ff9030', opacity=0.65,
+                             smooth_shading=True, name='wcalib_region_fitted')
+            plotter.reset_camera()
+        except Exception as e:
+            self.log_view.append(f'結果表示中にエラー: {e}')
+        lay.addWidget(plotter.interactor)
+
+        def _on_close(_ev, p=plotter):
+            try:
+                p.close()
+            except Exception:
+                pass
+        dlg.finished.connect(lambda _r: _on_close(None))
+        if not hasattr(self, '_fit_dialogs'):
+            self._fit_dialogs = []
+        self._fit_dialogs.append(dlg)
+        dlg.showMaximized()
+
+    # ===== C_se_X 生成/消去 =====
+    def _build_c_se_x(self):
+        pts = self.shared_clump_points.get(type(self).PLANE_KEY_CLUMP, [])
+        arr = np.array(list(pts), dtype=float)
+        if arr.shape[0] < 3:
+            self.log_view.append(f'C_se_X: Clump YZ平面には3点以上が必要です（現在 {arr.shape[0]} 点）。')
+            return
+        fit = self.tab2._fit_plane_basis(arr)
+        if fit is None:
+            self.log_view.append('C_se_X: YZ平面のフィッティングに失敗しました。')
+            return
+        center, normal, _u, _v = fit
+        # 法線の符号: Ver.2 から取り込んだ C_world があればその +X 方向に向ける、無ければ STL +X 軸
+        ref = np.array([1.0, 0.0, 0.0])
+        cw = self._get_c_world_from_ver2()
+        if cw is not None:
+            ref = np.asarray(cw['ex'], dtype=float)
+        if float(np.dot(normal, ref)) < 0:
+            normal = -normal
+        self.c_se_x = np.asarray(normal, dtype=float)
+        self.c_se_origin = np.asarray(center, dtype=float)
+        self.clear_cse_btn.setEnabled(True)
+        self.log_view.append(
+            f'C_se_X（YZ平面法線）を構築しました: '
+            f'origin=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}), '
+            f'normal=({normal[0]:+.4f}, {normal[1]:+.4f}, {normal[2]:+.4f}), points={arr.shape[0]}'
+        )
+        self._render_view(reset_view=False)
+        self._update_check_label()
+        self._save_to_settings()
+
+    def _clear_c_se_x(self):
+        if self.c_se_x is None:
+            return
+        self.c_se_x = None
+        self.c_se_origin = None
+        self.clear_cse_btn.setEnabled(False)
+        self.log_view.append('C_se_X を消去しました。')
+        self._render_view(reset_view=False)
+        self._update_check_label()
+
+    # ===== 表示トグル =====
+    def _on_show_xpar_toggled(self, checked):
+        self.show_x_parallel = bool(checked)
+        self._render_view(reset_view=False)
+        self._save_to_settings()
+
+    def _on_show_cworld_toggled(self, checked):
+        self.show_cworld = bool(checked)
+        self._render_view(reset_view=False)
+        self._save_to_settings()
+
+    def _on_show_cse_toggled(self, checked):
+        self.show_cse = bool(checked)
+        self._render_view(reset_view=False)
+        self._save_to_settings()
+
+    # ===== 平面サブタブ切替 =====
+    def _on_plane_subtab_changed(self, index):
+        self.active_plane_index = index
+        if index < 0 or index >= len(self.plane_widgets):
+            return
+        if self.plotter is None or self.current_mesh is None:
+            return
+        active = self.plane_widgets[index]
+        try:
+            self.plotter.disable_picking()
+        except Exception:
+            pass
+        if active.point_add_enabled:
+            try:
+                self.plotter.enable_surface_point_picking(
+                    callback=lambda point, *_args: self.tab2._on_plane_surface_point_picked(active, point),
+                    left_clicking=True, right_clicking=True, show_point=False, pickable_window=False,
+                )
+            except Exception:
+                pass
+        self._render_view(reset_view=False)
+
+    # plane-point 系のコールバックから呼ばれる（_on_plane_surface_point_picked 経由）
+    def _refresh_all_plane_views(self, reset_view=False):
+        self._render_view(reset_view=reset_view)
+        self._save_to_settings()
+
+    # Ver.2 ALL VIEW で軸が取り込まれた時に呼ばれる（_on_axes_imported_callbacks 経由）
+    def _on_ver2_axes_imported(self):
+        try:
+            self._update_check_label()
+        except Exception:
+            pass
+        try:
+            if self.current_mesh is not None:
+                self._render_view(reset_view=False)
+        except Exception:
+            pass
+
+    # ===== 描画 =====
+    def _render_view(self, reset_view=False):
+        if self.plotter is None or not HAS_PYVISTA:
+            return
+        try:
+            self.plotter.disable_picking()
+        except Exception:
+            pass
+        cam = None
+        if not reset_view:
+            try:
+                cam = self.plotter.camera_position
+            except Exception:
+                cam = None
+        self.plotter.clear()
+        bg, model_color = self.tab2._load_visual_settings()
+        self.plotter.set_background(bg, top=self.tab2._background_top_color(bg))
+        self.tab2._configure_lights_for_widget(self, plotter=self.plotter)
+        self.plotter.hide_axes()
+
+        if self.current_mesh is None:
+            self.plotter.add_text('STL（with clump）を読み込んでください', position='upper_left', font_size=10)
+            self.plotter.render()
+            return
+
+        # 本体 STL
+        self.plotter.add_mesh(
+            self.current_mesh, name='stl_model', color=model_color,
+            show_edges=False, smooth_shading=True,
+            ambient=0.15, diffuse=0.75, specular=0.35, specular_power=25.0,
+            pickable=True,
+        )
+        # 固定部領域 STL（半透明オーバーレイ）
+        if self.region_mesh is not None:
+            try:
+                self.plotter.add_mesh(
+                    self.region_mesh, name='region_mesh', color='#60d0ff',
+                    opacity=0.35, show_edges=False, pickable=False,
+                    reset_camera=False, render=False,
+                )
+            except Exception:
+                pass
+
+        b = self.current_mesh.bounds
+        diag = float(np.linalg.norm([b[1]-b[0], b[3]-b[2], b[5]-b[4]])) or 100.0
+
+        # ピック点を描画（Clump YZ平面のみ）
+        plane_colors = {
+            type(self).PLANE_KEY_CLUMP: '#f0c040',
+        }
+        for plane_label, points in self.shared_clump_points.items():
+            if not points:
+                continue
+            color = plane_colors.get(plane_label, '#ffffff')
+            arr = np.array(list(points), dtype=float)
+            try:
+                pdata = pv.PolyData(arr)
+                self.plotter.add_mesh(
+                    pdata, name=f'pts_{plane_label}', color=color,
+                    point_size=14, render_points_as_spheres=True, style='points',
+                    pickable=False, reset_camera=False, render=False,
+                )
+            except Exception:
+                pass
+
+        # 選択中の点
+        active = self.plane_widgets[self.active_plane_index] if 0 <= self.active_plane_index < len(self.plane_widgets) else None
+        if active is not None and 0 <= active.selected_point_index < len(active.points):
+            try:
+                sel = np.array([active.points[active.selected_point_index]], dtype=float)
+                self.plotter.add_mesh(
+                    pv.PolyData(sel), name='selected_point', color='#ffff66',
+                    point_size=18, render_points_as_spheres=True, style='points',
+                    pickable=False, reset_camera=False, render=False,
+                )
+            except Exception:
+                pass
+
+        # C_world（3軸矢印） — Ver.2 ALL VIEW から自動参照
+        cw = self._get_c_world_from_ver2()
+        if self.show_cworld and cw is not None:
+            axis_len = max(diag * 0.18, 1.0)
+            origin = np.asarray(cw['origin'], dtype=float)
+            for suffix, vec, color in (
+                ('_x', cw['ex'], '#ff3030'),
+                ('_y', cw['ey'], '#3060ff'),
+                ('_z', cw['ez'], '#30c030'),
+            ):
+                try:
+                    arrow = pv.Arrow(start=origin, direction=vec, scale=axis_len,
+                                     shaft_radius=0.012, tip_radius=0.04, tip_length=0.18)
+                    self.plotter.add_mesh(arrow, name='cw'+suffix, color=color,
+                                          pickable=False, reset_camera=False, render=False)
+                except Exception:
+                    pass
+
+        # Clump YZ平面のリアルタイム表示（3点以上で最小二乗フィット）
+        clump_pts = self.shared_clump_points.get(type(self).PLANE_KEY_CLUMP, [])
+        if len(clump_pts) >= 3:
+            arr_pts = np.array(list(clump_pts), dtype=float)
+            fit = self.tab2._fit_plane_basis(arr_pts)
+            if fit is not None:
+                center, normal, u_vec, v_vec = fit
+                # 点群のひろがりから平面の表示サイズを決める
+                centered = arr_pts - center
+                u_proj = centered @ u_vec
+                v_proj = centered @ v_vec
+                u_half = float(max(np.abs(u_proj).max() if u_proj.size else 0.0, diag * 0.05))
+                v_half = float(max(np.abs(v_proj).max() if v_proj.size else 0.0, diag * 0.05))
+                # 余白
+                u_half *= 1.2
+                v_half *= 1.2
+                try:
+                    plane = pv.Plane(
+                        center=center,
+                        direction=normal,
+                        i_size=2.0 * u_half,
+                        j_size=2.0 * v_half,
+                    )
+                    self.plotter.add_mesh(
+                        plane, name='clump_yz_plane',
+                        color='#f0c040', opacity=0.30, show_edges=True,
+                        edge_color='#f0c040', pickable=False,
+                        reset_camera=False, render=False,
+                    )
+                except Exception:
+                    pass
+
+        # C_se_X（YZ 平面の法線、原点はその重心） — 矢印で描画
+        if self.show_cse and self.c_se_x is not None and self.c_se_origin is not None:
+            axis_len = max(diag * 0.18, 1.0)
+            try:
+                arrow = pv.Arrow(start=self.c_se_origin, direction=self.c_se_x, scale=axis_len,
+                                 shaft_radius=0.014, tip_radius=0.045, tip_length=0.2)
+                self.plotter.add_mesh(arrow, name='cse_x', color='#f0c040',
+                                      pickable=False, reset_camera=False, render=False)
+            except Exception:
+                pass
+
+        # X_parallel-axis を Ver.2 ALL VIEW から自動参照して**線**で表示
+        if self.show_x_parallel:
+            xpar = self._get_x_parallel_from_ver2()
+            if xpar is not None:
+                d, pt_stl = xpar
+                # ALL VIEW と同じ：軸が通る点から ±(diag * 0.9) の長さの線分
+                line_half = diag * 0.9
+                start_pt = pt_stl - d * line_half
+                end_pt = pt_stl + d * line_half
+                try:
+                    line = pv.Line(start_pt, end_pt)
+                    self.plotter.add_mesh(
+                        line, name='x_parallel_line', color='#ff8040',
+                        line_width=4, pickable=False,
+                        reset_camera=False, render=False,
+                    )
+                except Exception:
+                    pass
+
+        if reset_view:
+            if not self.tab2._apply_shared_camera_to_plotter(self.plotter, self):
+                try:
+                    self.plotter.reset_camera(bounds=self.current_mesh.bounds)
+                except Exception:
+                    pass
+        elif cam is not None:
+            try:
+                self.plotter.camera_position = cam
+            except Exception:
+                pass
+
+        # ピック点追加モードが ON の場合、最終的に picker を再有効化
+        # （render の冒頭で disable_picking してしまうため、ここで復活させる必要がある）
+        active = self.plane_widgets[self.active_plane_index] if 0 <= self.active_plane_index < len(self.plane_widgets) else None
+        if active is not None and getattr(active, 'point_add_enabled', False):
+            try:
+                self.plotter.enable_surface_point_picking(
+                    callback=lambda point, *_args: self.tab2._on_plane_surface_point_picked(active, point),
+                    left_clicking=True, right_clicking=True, show_point=False, pickable_window=False,
+                )
+            except Exception:
+                pass
+        # ボタンの有効/無効を STL の有無に応じて更新
+        for pw in self.plane_widgets:
+            if hasattr(pw, 'point_add_btn'):
+                try:
+                    pw.point_add_btn.setEnabled(self.current_mesh is not None)
+                except Exception:
+                    pass
+        self.plotter.render()
+
+    # ===== C_world を Ver.2 ALL VIEW から取得（フィット結果で座標変換） =====
+    def _get_c_world_from_ver2(self):
+        """Ver.2 ALL VIEW で構築済みの C_world (origin/ex/ey/ez) を、フィット結果
+        T (このタブ STL → base STL) の逆変換で「このタブの STL 座標」へ持ち込んで返す。
+
+        fit_transform が未確定の場合は None（つまり何も描画されない）。
+        これにより、フィット前は C_world が出ない＝STL 読込直後に勝手に C_world が
+        表示される問題が起きない。
+        """
+        if self.fit_transform is None:
+            return None
+        av = getattr(self.tab2, 'all_view_widget', None)
+        if av is None:
+            return None
+        cw = getattr(av, 'c_world', None)
+        if not cw:
+            return None
+        try:
+            T = np.asarray(self.fit_transform, dtype=float)  # this STL → base STL
+            T_inv = np.linalg.inv(T)
+            R_inv = T_inv[:3, :3]
+            t_inv = T_inv[:3, 3]
+            origin_base = np.asarray(cw['origin'], dtype=float)
+            origin_this = R_inv @ origin_base + t_inv
+            ex_this = R_inv @ np.asarray(cw['ex'], dtype=float)
+            ey_this = R_inv @ np.asarray(cw['ey'], dtype=float)
+            ez_this = R_inv @ np.asarray(cw['ez'], dtype=float)
+            return {
+                'origin': origin_this,
+                'ex': ex_this,
+                'ey': ey_this,
+                'ez': ez_this,
+            }
+        except Exception:
+            return None
+
+    # ===== X_parallel-axis を Ver.2 ALL VIEW から取得（C_world 経由で座標変換） =====
+    def _get_x_parallel_from_ver2(self):
+        """Ver.2 ALL VIEW で取り込み済みの X_parallel-axis (方向, 原点) を返す。
+
+        Ver.2 の motion_axis['point'] と ['direction'] は **C_world 座標系**で保存されている
+        (`_compute_motion_axis` のログ「C_world 座標系上」が根拠)。
+        従って、このタブの STL 座標系での表現は:
+            p_stl = O_w_this + R_w_this @ p_cworld
+            d_stl = R_w_this @ d_cworld
+        ここで R_w_this, O_w_this はこのタブの STL 座標で表した C_world の基底と原点
+        （= _get_c_world_from_ver2() の結果）。
+
+        fit_transform 未確定の場合は _get_c_world_from_ver2() が None を返すので、
+        この関数も None を返す（=描画されない）。
+        """
+        cw = self._get_c_world_from_ver2()
+        if cw is None:
+            return None
+        av = getattr(self.tab2, 'all_view_widget', None)
+        if av is None:
+            return None
+        par_axes = getattr(av, 'parallel_axes', None)
+        if not par_axes:
+            return None
+        R_w = np.column_stack([
+            np.asarray(cw['ex'], dtype=float),
+            np.asarray(cw['ey'], dtype=float),
+            np.asarray(cw['ez'], dtype=float),
+        ])
+        O_w = np.asarray(cw['origin'], dtype=float)
+        for entry in par_axes:
+            try:
+                name = entry.get('name') or entry.get('axis') or ''
+            except Exception:
+                continue
+            # 'X_parallel-axis' のように先頭が X_ で始まるエントリのみ採用
+            if str(name).upper().startswith('X_') and 'PARALLEL' in str(name).upper():
+                d_cw = entry.get('direction')
+                if d_cw is None:
+                    d_cw = entry.get('d') or entry.get('dir')
+                p_cw = entry.get('point')
+                if p_cw is None:
+                    p_cw = entry.get('origin') or entry.get('o')
+                if d_cw is None:
+                    continue
+                d_cw = np.asarray(d_cw, dtype=float)
+                if np.linalg.norm(d_cw) < 1e-12:
+                    continue
+                d_cw = d_cw / np.linalg.norm(d_cw)
+                # C_world 座標 → このタブの STL 座標へ
+                d_stl = R_w @ d_cw
+                n = float(np.linalg.norm(d_stl))
+                if n < 1e-12:
+                    continue
+                d_stl = d_stl / n
+                if p_cw is None:
+                    p_stl = O_w.copy()
+                else:
+                    p_cw = np.asarray(p_cw, dtype=float)
+                    p_stl = O_w + R_w @ p_cw
+                return d_stl, p_stl
+        return None
+
+    # ===== 検討事項の計算と表示 =====
+    def _update_check_label(self):
+        if self.c_se_x is None:
+            self.check_label.setText('（Clump YZ平面に3点以上ピック → 「C_se_X を生成」で C_se の X 軸を構築してください）')
+            return
+        if self.fit_transform is None:
+            self.check_label.setText(
+                '（C_se_X は構築済み。次は「Ver.2 base 固定部領域へフィッティング」を実行して、'
+                'Ver.2 の C_world と X_parallel-axis をこのタブの STL 座標へ持ち込んでください。）'
+            )
+            return
+        xpar = self._get_x_parallel_from_ver2()
+        if xpar is None:
+            self.check_label.setText(
+                '（C_se_X とフィットは完了。Ver.2 ALL VIEW で「X/Y/Z parallel-axis を取り込み」を'
+                '実行すると、X_parallel-axis との傾きと C_world Z 軸まわりの符号付き修正角が'
+                'ここに表示されます。）'
+            )
+            return
+        d_target = xpar[0]                                        # 目標: X_parallel
+        d_current = np.asarray(self.c_se_x, dtype=float)         # 現状: C_se_X
+        # 平面間角（0..90°）— 反平行は等価扱い
+        cos_raw = float(np.clip(abs(float(np.dot(d_target, d_current)
+                                          / (np.linalg.norm(d_target)*np.linalg.norm(d_current)))), 0.0, 1.0))
+        tilt_deg = float(np.degrees(np.arccos(cos_raw)))
+
+        html = [
+            '<b>W軸校正：C_se の X 軸 vs X_parallel-axis</b>',
+            f'　C_se_X（YZ平面法線）方向 = ({d_current[0]:+.4f}, {d_current[1]:+.4f}, {d_current[2]:+.4f})',
+            f'　X_parallel-axis 方向      = ({d_target[0]:+.4f}, {d_target[1]:+.4f}, {d_target[2]:+.4f})',
+            f'　<b>傾き（理想 平行 = 0°）: {tilt_deg:.4f}°</b>',
+        ]
+
+        cw = self._get_c_world_from_ver2()
+        if cw is None:
+            html.append('　<span style="color:#ffd060">C_world が未構築のため、符号付き修正角は計算できません（Ver.2 ALL VIEW で W平面1/2/3 をピックして C_world 座標系を生成してください）。</span>')
+        else:
+            d_about = np.asarray(cw['ez'], dtype=float)   # C_world Z 軸（緑） まわり
+            ang = _signed_correction_angle(d_target, d_current, d_about)
+            if ang is None:
+                html.append('　符号付き修正角: 計算できません（射影が縮退）。')
+            else:
+                # 右ネジ正方向の説明: C_world Z 軸（緑）まわりに angle°回せば C_se_X が X_parallel に揃う
+                sign_word = 'C_world Z軸（緑）の右ネジ正方向に' if ang >= 0 else 'C_world Z軸（緑）の右ネジ負方向（逆ネジ）に'
+                html.append(
+                    f'　<b>修正方法</b>: {sign_word} <b>{abs(ang):.4f}°</b> 回転'
+                    f'（符号付き: {ang:+.4f}°）'
+                )
+                # 修正後の残差
+                try:
+                    th = np.radians(ang)
+                    u = d_about / (np.linalg.norm(d_about) or 1.0)
+                    K = np.array([[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]])
+                    R = np.eye(3) + np.sin(th)*K + (1 - np.cos(th))*(K @ K)
+                    d_after = R @ d_current
+                    cos2 = float(np.clip(abs(float(np.dot(d_target, d_after) /
+                                                          (np.linalg.norm(d_target)*np.linalg.norm(d_after)))), 0.0, 1.0))
+                    res = float(np.degrees(np.arccos(cos2)))
+                    html.append(f'　修正後の残差（理想 0°）: {res:.4f}°')
+                except Exception:
+                    pass
+        self.check_label.setText('<br>'.join(html))
+
+    # ===== 永続化 =====
+    def _save_to_settings(self):
+        if self._loading:
+            return
+        try:
+            settings = load_settings() or {}
+            top = settings.setdefault(self.tab2.settings_top_key, {})
+            entry = top.setdefault(type(self).SETTINGS_KEY, {})
+            entry['stl_path'] = self.stl_path or None
+            entry['region_stl_path'] = self.region_stl_path or None
+            entry['clump_points'] = {
+                k: [[float(p[0]), float(p[1]), float(p[2])] for p in v]
+                for k, v in self.shared_clump_points.items()
+            }
+            # C_world は Ver.2 から自動参照するため、ここでは保存しない
+            # フィット結果 (this STL → base STL 変換)
+            entry['fit_transform'] = (
+                np.asarray(self.fit_transform, dtype=float).tolist()
+                if self.fit_transform is not None else None
+            )
+            entry['fit_result'] = self.fit_result if isinstance(self.fit_result, dict) else None
+            entry['c_se_x'] = (
+                {
+                    'normal': [float(v) for v in self.c_se_x],
+                    'origin': [float(v) for v in (self.c_se_origin if self.c_se_origin is not None else [0,0,0])],
+                }
+                if self.c_se_x is not None else None
+            )
+            entry['show_x_parallel'] = bool(self.show_x_parallel)
+            entry['show_cworld'] = bool(self.show_cworld)
+            entry['show_cse'] = bool(self.show_cse)
+            save_settings(settings)
+        except Exception:
+            pass
+
+    def _serialize_frame(self, f):
+        if f is None:
+            return None
+        try:
+            return {
+                'origin': [float(v) for v in f['origin']],
+                'ex': [float(v) for v in f['ex']],
+                'ey': [float(v) for v in f['ey']],
+                'ez': [float(v) for v in f['ez']],
+            }
+        except Exception:
+            return None
+
+    def _load_from_settings(self):
+        self._loading = True
+        try:
+            settings = load_settings() or {}
+            entry = (settings.get(self.tab2.settings_top_key) or {}).get(type(self).SETTINGS_KEY) or {}
+        except Exception:
+            entry = {}
+        try:
+            cp = entry.get('clump_points') or {}
+            ck = type(self).PLANE_KEY_CLUMP
+            self.shared_clump_points[ck] = [np.asarray(p, dtype=float) for p in (cp.get(ck) or [])]
+            for pw in self.plane_widgets:
+                if getattr(pw, 'plane_label', '') == ck:
+                    pw.points = self.shared_clump_points[ck]
+                    pw._refresh_point_list()
+            ft = entry.get('fit_transform')
+            if ft is not None:
+                try:
+                    self.fit_transform = np.asarray(ft, dtype=float)
+                    self.fit_result = entry.get('fit_result') if isinstance(entry.get('fit_result'), dict) else None
+                    self.clear_fit_btn.setEnabled(True)
+                    self.fit_check_btn.setEnabled(True)
+                    rmse = (self.fit_result or {}).get('icp_rmse')
+                    fitness = (self.fit_result or {}).get('icp_fitness')
+                    if isinstance(rmse, (int, float)) and isinstance(fitness, (int, float)):
+                        self.fit_status_label.setText(
+                            f'フィット完了（復元）: ICP fitness={fitness:.4f} / rmse={rmse:.4f} mm'
+                        )
+                        self.fit_status_label.setStyleSheet('color: #80ff80; font-size: 10px;')
+                    else:
+                        self.fit_status_label.setText('フィット完了（復元）')
+                        self.fit_status_label.setStyleSheet('color: #80ff80; font-size: 10px;')
+                except Exception:
+                    self.fit_transform = None
+            cse = entry.get('c_se_x')
+            if cse:
+                self.c_se_x = np.asarray(cse.get('normal'), dtype=float)
+                self.c_se_origin = np.asarray(cse.get('origin'), dtype=float)
+                self.clear_cse_btn.setEnabled(True)
+            self.show_x_parallel = bool(entry.get('show_x_parallel', True))
+            self.show_cworld = bool(entry.get('show_cworld', True))
+            self.show_cse = bool(entry.get('show_cse', True))
+            try:
+                self.show_xpar_cb.setChecked(self.show_x_parallel)
+                self.show_cworld_cb.setChecked(self.show_cworld)
+                self.show_cse_cb.setChecked(self.show_cse)
+            except Exception:
+                pass
+            self.stl_path = entry.get('stl_path') or None
+            self.region_stl_path = entry.get('region_stl_path') or None
+        finally:
+            self._loading = False
+
+        # STL を非同期で復元
+        if self.stl_path and os.path.exists(self.stl_path):
+            self.log_view.append(f'前回の STL を復元します: {self.stl_path}')
+            self._start_load_stl(self.stl_path, preserve_state=True)
+        elif self.stl_path:
+            self.log_view.append(f'前回の STL が見つかりません: {self.stl_path}')
+        # 領域 STL を同期復元
+        if self.region_stl_path and os.path.exists(self.region_stl_path):
+            self.log_view.append(f'前回の固定部領域 STL を復元します: {self.region_stl_path}')
+            try:
+                self._load_region_path(self.region_stl_path)
+            except Exception:
+                pass
+        elif self.region_stl_path:
+            self.log_view.append(f'前回の固定部領域 STL が見つかりません: {self.region_stl_path}')
+            self.region_stl_path = None
+        # 検討事項を初期更新
+        self._update_check_label()
+
+
 class FEAxisWidget(Tab2Widget):
     """「呂」タブの中身。
 

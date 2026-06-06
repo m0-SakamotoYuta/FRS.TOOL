@@ -11,7 +11,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QObject, QEvent
 from tabs.tab1 import Tab1Widget
-from tabs.tab2 import Tab2Widget, Tab2WidgetTMC, FEAxisWidget, InitialPostureCandidatesWidget
+from tabs.tab2 import (
+	Tab2Widget,
+	Tab2WidgetTMC,
+	FEAxisWidget,
+	InitialPostureCandidatesWidget,
+	WAxisCalibrationWidget,
+)
 from tabs.tab3 import Tab3Widget
 from tabs.tab4 import Tab4Widget
 
@@ -39,15 +45,19 @@ class MainWindow(QMainWindow):
 		self.tab1 = Tab1Widget()
 		# 都立大（既存データ tab2.* を引き継ぐ）
 		self.tab2 = Tab2Widget()
+		self.tab_wcalib = WAxisCalibrationWidget(self.tab2)
 		self.tab_candidates = InitialPostureCandidatesWidget(self.tab2)
 		# 医科大（永続化キーは tab2_tmc.* で完全独立）
 		self.tab2_tmc = Tab2WidgetTMC()
+		self.tab_wcalib_tmc = WAxisCalibrationWidget(self.tab2_tmc)
 		self.tab_candidates_tmc = InitialPostureCandidatesWidget(self.tab2_tmc)
 		self.tab_fe = FEAxisWidget()
 		self.tabs.addTab(self.tab1, '初期姿勢校正Ver. 1（色変更）')
 		self.tabs.addTab(self.tab2, '初期姿勢校正Ver. 2（都立大）')
+		self.tabs.addTab(self.tab_wcalib, 'W軸校正（都立大）')
 		self.tabs.addTab(self.tab_candidates, '初期姿勢候補（都立大）')
 		self.tabs.addTab(self.tab2_tmc, '初期姿勢校正Ver. 2（医科大）')
+		self.tabs.addTab(self.tab_wcalib_tmc, 'W軸校正（医科大）')
 		self.tabs.addTab(self.tab_candidates_tmc, '初期姿勢候補（医科大）')
 		self.tabs.addTab(self.tab_fe, '呂')
 		self.tabs.addTab(Tab3Widget(), 'KKR graph')
@@ -77,6 +87,17 @@ class MainWindow(QMainWindow):
 				cur = w.subtabs.currentIndex()
 				if cur >= 0:
 					w._on_current_changed(cur)
+			except Exception:
+				pass
+			return
+		# W軸校正（都立大 / 医科大）に切り替わった: 共有カメラを反映 + 検討事項更新
+		if isinstance(w, WAxisCalibrationWidget):
+			try:
+				w.tab2._apply_shared_camera_with_render(w)
+			except Exception:
+				pass
+			try:
+				w._update_check_label()
 			except Exception:
 				pass
 			return
